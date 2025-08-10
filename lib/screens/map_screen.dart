@@ -29,9 +29,6 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
 
   final Map<String, Uint8List> _placeIconImages = {};
   bool _iconsLoaded = false;
-  bool _styleImagesRegistered = false;
-
-  final Map<String, bool> _placeSunState = {};
 
   Timer? _mapIdleTimer;
   CameraState? _lastCameraState;
@@ -62,7 +59,6 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
     _mapboxMap = null; // The MapWidget handles its own disposal.
     _placeIconImages.clear();
     _annotationIdToPlace.clear();
-    _placeSunState.clear();
     super.dispose();
   }
 
@@ -102,42 +98,8 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
     _placeIconImages.addEntries(results.where((entry) => entry.value.isNotEmpty));
 
     if (mounted) {
-      setState(() {
-        _iconsLoaded = true;
-        _styleImagesRegistered = false;
-      });
-      await _ensureStyleImagesRegistered();
+      setState(() => _iconsLoaded = true);
       if (_mapReady && !_isRedrawing) _tryRedraw("icons loaded");
-    }
-  }
-
-  Future<void> _ensureStyleImagesRegistered() async {
-    if (_mapboxMap == null || !_mapReady || _styleImagesRegistered) return;
-    try {
-      final style = _mapboxMap!.style;
-      for (final entry in _placeIconImages.entries) {
-        await style.setStyleImage(entry.key, entry.value, false);
-      }
-      _styleImagesRegistered = true;
-    } catch (e) {
-      if (kDebugMode) print("ℹ️ MapScreen: Error registering style images: $e");
-    }
-  }
-
-  Future<void> _recreateAnnotationManagers() async {
-    if (_mapboxMap == null) return;
-    try {
-      _polygonManager = await _mapboxMap!.annotations.createPolygonAnnotationManager();
-      _pointAnnotationManager = await _mapboxMap!.annotations.createPointAnnotationManager();
-      _annotationIdToPlace.clear();
-      _pointAnnotationManager?.addOnPointAnnotationClickListener(
-        AnnotationClickListener(onAnnotationClick: (annotation) {
-          final place = _annotationIdToPlace[annotation.id];
-          if (place != null) _showPlaceDialog(place);
-        }),
-      );
-    } catch (e) {
-      if (kDebugMode) print("❌ MapScreen: Error recreating annotation managers: $e");
     }
   }
 
@@ -152,7 +114,15 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
 
     try {
       await _mapboxMap?.setCamera(CameraOptions(center: initialCenter, zoom: initialZoom));
-      await _recreateAnnotationManagers();
+      // Create annotation managers. These are associated with the map instance.
+      _polygonManager = await mapboxMap.annotations.createPolygonAnnotationManager();
+      _pointAnnotationManager = await mapboxMap.annotations.createPointAnnotationManager();
+      _pointAnnotationManager?.addOnPointAnnotationClickListener(
+        AnnotationClickListener(onAnnotationClick: (annotation) {
+          final place = _annotationIdToPlace[annotation.id];
+          if (place != null) _showPlaceDialog(place);
+        }),
+      );
     } catch (e) {
       if (kDebugMode) print("❌ MapScreen: Error during map/annotation manager setup: $e");
     }
@@ -161,27 +131,15 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
   void _onMapLoaded(MapLoadedEventData event) {
     if (!mounted) return;
     _mapReady = true;
-    _styleImagesRegistered = false;
-    _placeSunState.clear();
-    _ensureStyleImagesRegistered();
-    _recreateAnnotationManagers().then((_) {
-      _updateLastCameraState().then((_) {
-        if (mounted && _lastCameraState != null) {
-          _previousIdleCameraState = _lastCameraState;
-          if (!_isRedrawing) {
-            _triggerDataFetch(); // Fetch initial data for the view
-            _tryRedraw("map loaded initial"); // Initial draw
-          }
+    _updateLastCameraState().then((_) {
+      if (mounted && _lastCameraState != null) {
+        _previousIdleCameraState = _lastCameraState;
+        if (!_isRedrawing) {
+          _triggerDataFetch(); // Fetch initial data for the view
+          _tryRedraw("map loaded initial"); // Initial draw
         }
-      });
+      }
     });
-  }
-
-  void _onStyleLoaded(StyleLoadedEventData event) {
-    if (!mounted) return;
-    _styleImagesRegistered = false;
-    _placeSunState.clear();
-    _ensureStyleImagesRegistered();
   }
 
   void _onCameraIdle(MapIdleEventData event) {
@@ -255,6 +213,23 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
       if (kDebugMode) print("❌ MapScreen: Error in _triggerDataFetch: $e");
     }
   }
+
+  Future<void> _clearAllAnnotations() async {
+    // Clear polygon annotations (shadows)
+    try {
+      await _polygonManager?.deleteAll();
+    } catch (e) {
+      if (kDebugMode) print("ℹ️ MapScreen: Info clearing polygon annotations: $e");
+    }
+    // Clear point annotations (places)
+    try {
+      await _pointAnnotationManager?.deleteAll();
+    } catch (e) {
+      if (kDebugMode) print("ℹ️ MapScreen: Info clearing point annotations: $e");
+    }
+    _annotationIdToPlace.clear(); // Clear the local mapping
+  }
+
   void _moveCameraTo(Point center, {required double zoom}) {
     if (!mounted || _mapboxMap == null) return;
     _mapboxMap?.flyTo(
@@ -293,10 +268,6 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
     return lat > minLat && lat < maxLat && lng > minLng && lng < maxLng;
   }
 
-  String _iconNameFor(PlaceType type, bool isInSun) {
-    return SunUtils.getIconPath(type, isInSun);
-  }
-
   Future<void> _tryRedraw(String source) async {
     if (_isRedrawing) {
       if (kDebugMode) print("ℹ️ MapScreen: Redraw skipped, already in progress (source: $source)");
@@ -320,6 +291,9 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
       final CoordinateBounds currentViewportBounds = await _mapboxMap!.coordinateBoundsForCamera(_lastCameraState!.toCameraOptions());
 
       _lastDrawTime = dateTime;
+      await _clearAllAnnotations(); // Clear previous drawings
+
+      // Calculate and draw building shadows first, as places' sun status depends on them.
       final Map<String, List<Position>> calculatedShadows =
       await _calculateAndDrawBuildingShadows(allLoadedBuildings, dateTime, currentViewportBounds);
 
@@ -341,12 +315,6 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
   Future<Map<String, List<Position>>> _calculateAndDrawBuildingShadows(
       List<Building> allLoadedBuildings, DateTime dateTime, CoordinateBounds currentViewportBounds) async {
     if (!mounted || _polygonManager == null || _lastCameraState == null) return {};
-
-    try {
-      await _polygonManager!.deleteAll();
-    } catch (e) {
-      if (kDebugMode) print("ℹ️ MapScreen: Info clearing polygon annotations: $e");
-    }
 
     // Calculate sun position based on the center of the current map view for general shadow direction and opacity.
     final sunPosCenter = SunUtils.getSunPosition(
@@ -470,7 +438,6 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
       Map<String, List<Position>> calculatedShadowsForLogic, CoordinateBounds currentViewportBounds) async {
     if (!mounted || _pointAnnotationManager == null || !_iconsLoaded || _lastCameraState == null) return;
 
-    final Map<String, bool> newSunState = {};
     final List<PointAnnotationOptions> annotationOptionsList = [];
     final List<Place> placesForCreatedAnnotations = []; // To map created annotation IDs back to Places
 
@@ -559,40 +526,31 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
         isEffectivelyInSun = false;
       }
 
-      final iconName = _iconNameFor(place.type, isEffectivelyInSun);
-      newSunState[place.id] = isEffectivelyInSun;
-      annotationOptionsList.add(PointAnnotationOptions(
-        geometry: place.location,
-        iconImageName: iconName,
-        iconSize: iconScale,
-        iconAnchor: IconAnchor.BOTTOM, // Anchor icon at its bottom center
-        iconOffset: [0.0, -2.0 * iconScale], // Slight vertical offset to make bottom sit on point
-        symbolSortKey: 10, // Ensure places are drawn above shadows (shadows are fillSortKey 0)
-      ));
-      placesForCreatedAnnotations.add(place);
-    }
+      final iconKey = SunUtils.getIconPath(place.type, isEffectivelyInSun);
+      final iconBytes = _placeIconImages[iconKey];
 
-    bool annotationsChanged = false;
-    if (_placeSunState.length != newSunState.length) {
-      annotationsChanged = true;
-    } else {
-      for (final entry in newSunState.entries) {
-        if (_placeSunState[entry.key] != entry.value) {
-          annotationsChanged = true;
-          break;
-        }
+      if (iconBytes != null && iconBytes.isNotEmpty) {
+        annotationOptionsList.add(PointAnnotationOptions(
+          geometry: place.location,
+          image: iconBytes,
+          iconSize: iconScale,
+          iconAnchor: IconAnchor.BOTTOM, // Anchor icon at its bottom center
+          iconOffset: [0.0, -2.0 * iconScale], // Slight vertical offset to make bottom sit on point
+          symbolSortKey: 10, // Ensure places are drawn above shadows (shadows are fillSortKey 0)
+        ));
+        placesForCreatedAnnotations.add(place);
       }
     }
-    if (!annotationsChanged) return;
 
     try {
-      await _pointAnnotationManager?.deleteAll();
-      _annotationIdToPlace.clear();
+      _annotationIdToPlace.clear(); // Clear previous mapping
       if (annotationOptionsList.isNotEmpty) {
         final createdAnnotations = await _pointAnnotationManager!.createMulti(annotationOptionsList);
+        // Map the IDs of created annotations back to their corresponding Place objects
+        // This is crucial for click handling.
         if (createdAnnotations.length == placesForCreatedAnnotations.length) {
           for (int i = 0; i < createdAnnotations.length; i++) {
-            final PointAnnotation? annotation = createdAnnotations[i];
+            final PointAnnotation? annotation = createdAnnotations[i]; // Nullable
             if (annotation != null) {
               _annotationIdToPlace[annotation.id] = placesForCreatedAnnotations[i];
             }
@@ -601,12 +559,9 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
           if (kDebugMode) print("⚠️ MapScreen: Mismatch between created annotations and places list length.");
         }
       }
-      _placeSunState
-        ..clear()
-        ..addAll(newSunState);
     } catch (e) {
       if (kDebugMode) print("ℹ️ MapScreen: Info creating point annotations: $e");
-      _annotationIdToPlace.clear();
+      _annotationIdToPlace.clear(); // Clear if creation failed
     }
   }
 
@@ -656,7 +611,6 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
             textureView: true, // Recommended for performance on some platforms
             onMapCreated: _onMapCreated,
             onMapLoadedListener: _onMapLoaded,
-            onStyleLoadedListener: _onStyleLoaded,
             onMapIdleListener: _onCameraIdle,
             // onCameraChangeListener: _onCameraChanged, // If more frequent updates needed
           ),
