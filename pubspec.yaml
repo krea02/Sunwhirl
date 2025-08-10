@@ -1,0 +1,46 @@
+name: sunwhirlv1
+description: "A Flutter application to visualize sun and shadows on a map."
+publish_to: 'none' # Remove this line if you wish to publish to pub.dev
+
+version: 1.0.0+1
+
+environment:
+  # Use a flexible SDK range
+  sdk: '>=3.3.0 <4.0.0' # Allows newer Dart/Flutter versions within major version 3
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # Core Functionality
+  mapbox_maps_flutter: ^2.7.0   # Mapbox SDK (ensure this matches your specific needs/latest stable)
+  provider: ^6.1.2            # State management
+  http: ^1.2.1                # Network requests (Overpass API)
+  intl: ^0.19.0               # Date/Time formatting
+  # ---- Use correct version for dart_suncalc ----
+  # ---- End Correction ----
+  url_launcher: ^6.3.0        # Launching external URLs (navigation)
+
+  # Location Services (Optional but common for map apps)
+  geolocator: ^12.0.0         # Getting device location
+  permission_handler: ^11.3.1   # Requesting permissions (like location)
+
+  # UI Helpers
+  cupertino_icons: ^1.0.8     # Standard iOS style icons
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0         # Updated linter rules (or ^5.0.0 if preferred)
+
+flutter:
+  uses-material-design: true
+
+  # Assets (ensure these paths are correct in your project structure)
+  assets:
+    - assets/icons/cafe_sun.png
+    - assets/icons/cafe_moon.png
+    - assets/icons/pub_sun.png
+    - assets/icons/pub_moon.png
+    - assets/icons/park_sun.png
+    - assets/icons/park_moon.png
