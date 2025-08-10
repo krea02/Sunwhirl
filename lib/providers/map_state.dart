@@ -69,6 +69,7 @@ class MapState with ChangeNotifier {
     if (_flyToPlaceNeeded) {
       _flyToPlaceNeeded = false;
       if (kDebugMode) print("MapState: Fly-to handled, flag reset.");
+      _safeNotifyListeners();
     }
   }
 
