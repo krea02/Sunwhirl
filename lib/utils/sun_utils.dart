@@ -433,13 +433,15 @@ class SunUtils {
     final int maxIterations = uniquePointList.length * 2 + 5; // Increased slightly
 
     do {
+      iteration++; // Ensure iteration count always advances
       // Safeguard: if we are re-adding a point (other than start) or exceed iterations.
-      if (hullIndices.contains(currentPointIndex) && currentPointIndex != startPointIndex || iteration++ > maxIterations) {
+      if ((hullIndices.contains(currentPointIndex) && currentPointIndex != startPointIndex) ||
+          iteration > maxIterations) {
         if (kDebugMode) {
           print("Convex Hull Error: Loop detected or exceeded max iterations ($iteration > $maxIterations). Aborting. Hull size: ${hull.length}, Input size: ${uniquePointList.length}");
         }
         // Return what we have if it's somewhat valid, or empty if too small.
-        return hull.length >=3 ? hull : [];
+        return hull.length >= 3 ? hull : [];
       }
 
       hull.add(uniquePointList[currentPointIndex]);
