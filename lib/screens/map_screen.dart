@@ -37,7 +37,7 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
   bool _mapReady = false;
 
   // For click handling
-  final Map<String, Place> _annotationIdToPlace = {};       // annotation.id -> Place
+  final Map<String, Place> _annotationIdToPlace = {}; // annotation.id -> Place
 
   // Diffing for markers
   final Map<String, PointAnnotation> _placeIdToAnnotation = {}; // placeId -> annotation
@@ -46,6 +46,12 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
 
   DateTime? _lastDrawTime;
   bool _isRedrawing = false;
+
+  // Sticky icons: keep markers within padded viewport
+  static const double _markerPadMeters = 350.0; // try 300–500m for stickiness
+
+  // Safety cap for total annotations (prevents memory spikes)
+  static const int _kMaxAnnotations = 1200;
 
   @override
   bool get wantKeepAlive => true;
@@ -225,7 +231,8 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
     );
   }
 
-  // --- helpers ---
+  // ------------------ Helpers (bounds, scale, thinning) ------------------
+
   bool _checkAabbIntersection(CoordinateBounds b1, CoordinateBounds b2) {
     if (b1.northeast.coordinates.lng < b2.southwest.coordinates.lng ||
         b2.northeast.coordinates.lng < b1.southwest.coordinates.lng) return false;
@@ -254,6 +261,7 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
     if (z < 17.0) return 0.85;
     return 1.0;
   }
+
   String _bucketForZoom(double z) {
     if (z < 14.0) return "S";
     if (z < 15.5) return "M";
@@ -261,7 +269,65 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
     return "XL";
   }
 
-  // --- redraw pipeline ---
+  CoordinateBounds _padBounds(CoordinateBounds b, double padMeters) {
+    final sw = b.southwest.coordinates;
+    final ne = b.northeast.coordinates;
+    final midLat = (sw.lat + ne.lat) / 2.0;
+
+    final dLat = SunUtils.metersToLat(padMeters);
+    final dLng = SunUtils.metersToLng(padMeters, midLat.toDouble());
+
+    return CoordinateBounds(
+      southwest: Point(coordinates: Position(sw.lng - dLng, sw.lat - dLat)),
+      northeast: Point(coordinates: Position(ne.lng + dLng, ne.lat + dLat)),
+      infiniteBounds: false,
+    );
+  }
+
+  /// Returns indices (into `opts`) to keep, using a coarse grid for geographic spread.
+  List<int> _thinByGrid(List<PointAnnotationOptions> opts, int targetCount) {
+    if (opts.length <= targetCount) {
+      return List<int>.generate(opts.length, (i) => i);
+    }
+
+    const int grid = 32;
+    final chosen = <int>{};
+    final firstInCell = <int, int>{};
+
+    double _norm(double v, double a, double b) => ((v - a) / (b - a + 1e-12)).clamp(0.0, 0.9999);
+
+    // Envelope of batch
+    double minLat = double.infinity, maxLat = -double.infinity;
+    double minLng = double.infinity, maxLng = -double.infinity;
+    for (final o in opts) {
+      final p = (o.geometry as Point).coordinates;
+      minLat = math.min(minLat, p.lat.toDouble());
+      maxLat = math.max(maxLat, p.lat.toDouble());
+      minLng = math.min(minLng, p.lng.toDouble());
+      maxLng = math.max(maxLng, p.lng.toDouble());
+    }
+
+    // One per cell, then fill remainder
+    for (int i = 0; i < opts.length; i++) {
+      final p = (opts[i].geometry as Point).coordinates;
+      final c = (_norm(p.lng.toDouble(), minLng, maxLng) * grid).floor();
+      final r = (_norm(p.lat.toDouble(), minLat, maxLat) * grid).floor();
+      final key = r * 1000 + c;
+      if (!firstInCell.containsKey(key)) {
+        firstInCell[key] = i;
+        chosen.add(i);
+        if (chosen.length >= targetCount) break;
+      }
+    }
+    for (int i = 0; i < opts.length && chosen.length < targetCount; i++) {
+      chosen.add(i);
+    }
+
+    return chosen.toList()..sort();
+  }
+
+  // ------------------ Redraw pipeline ------------------
+
   Future<void> _tryRedraw(String source) async {
     if (_isRedrawing) {
       if (kDebugMode) print("ℹ️ MapScreen: Redraw skipped (already running) — source: $source");
@@ -307,7 +373,7 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
       ) async {
     if (!mounted || _polygonManager == null || _lastCameraState == null) return {};
 
-    // Clear previous polygons first so nothing accumulates
+    // Clear previous polygons so nothing accumulates
     try {
       await _polygonManager!.deleteAll();
     } catch (_) {}
@@ -334,7 +400,7 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
 
     // base opacity curve (soft)
     final altDeg = sunAltitudeRad * SunUtils.deg;
-    const double maxShadowOpacity = 0.22;
+    const double maxShadowOpacity = 0.30; // tweak in 0.12–0.28 range
     const double horizonFadeEndAlt = SunUtils.altitudeThresholdRad * SunUtils.deg + 0.5;
     const double horizonFadeStartAlt = 5.0;
     const double peakOpacityStartAlt = 20.0;
@@ -458,8 +524,11 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
     final double iconScale = _iconScaleForZoom(zoom);
     final String newBucket = _bucketForZoom(zoom);
 
+    // Sticky bounds: keep markers in a padded viewport so they “stick” when panning slowly
+    final paddedBounds = _padBounds(currentViewportBounds, _markerPadMeters);
+
     final relevantBuildings =
-    allLoadedBuildings.where((b) => _checkAabbIntersection(b.bounds, currentViewportBounds)).toList();
+    allLoadedBuildings.where((b) => _checkAabbIntersection(b.bounds, paddedBounds)).toList();
 
     final visiblePlaceIds = <String>{};
     final toDelete = <PointAnnotation>[];
@@ -469,7 +538,7 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
     final newSunState = <String, bool>{};
 
     for (final place in allLoadedPlaces) {
-      if (!_isPointInBounds(place.location.coordinates, currentViewportBounds, inclusive: true)) continue;
+      if (!_isPointInBounds(place.location.coordinates, paddedBounds, inclusive: true)) continue;
       visiblePlaceIds.add(place.id);
 
       final placeLat = place.location.coordinates.lat.toDouble();
@@ -561,8 +630,14 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
       }
     }
 
-    // Remove those that went off-screen
-    final gone = _placeIdToAnnotation.keys.where((id) => !visiblePlaceIds.contains(id)).toList();
+    // Remove those that went off the padded viewport
+    final gone = _placeIdToAnnotation.keys.where((id) {
+      final ann = _placeIdToAnnotation[id];
+      if (ann == null) return true;
+      final pt = ann.geometry.coordinates;
+      return !_isPointInBounds(pt, paddedBounds, inclusive: true);
+    }).toList();
+
     for (final pid in gone) {
       final ann = _placeIdToAnnotation[pid];
       if (ann != null) {
@@ -571,7 +646,7 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
       }
     }
 
-    // Apply deletes
+    // Apply deletes first
     if (toDelete.isNotEmpty) {
       for (final pid in toDeletePlaceIds) {
         final ann = _placeIdToAnnotation.remove(pid);
@@ -586,7 +661,32 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
       }
     }
 
-    // Create new / recreated
+    // Enforce cap via grid thinning (for toCreate batch)
+    if (toCreate.isNotEmpty) {
+      final existingCount = _placeIdToAnnotation.length;
+      final budget = (_kMaxAnnotations - existingCount).clamp(0, _kMaxAnnotations);
+      if (budget <= 0) {
+        // no room to add more
+        toCreate.clear();
+        placesForCreatedAnnotations.clear();
+      } else if (toCreate.length > budget) {
+        final keepIdx = _thinByGrid(toCreate, budget);
+        final filteredCreate = <PointAnnotationOptions>[];
+        final filteredPlaces = <Place>[];
+        for (final idx in keepIdx) {
+          filteredCreate.add(toCreate[idx]);
+          filteredPlaces.add(placesForCreatedAnnotations[idx]);
+        }
+        toCreate
+          ..clear()
+          ..addAll(filteredCreate);
+        placesForCreatedAnnotations
+          ..clear()
+          ..addAll(filteredPlaces);
+      }
+    }
+
+    // Create / recreate
     if (toCreate.isNotEmpty) {
       try {
         final created = await _pointAnnotationManager!.createMulti(toCreate);
@@ -603,13 +703,14 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
       }
     }
 
+    // Update remembered state
     _placeSunState
       ..clear()
       ..addAll(newSunState);
     _iconScaleBucket = newBucket;
   }
 
-  // --- UI ---
+  // ------------------ UI ------------------
   @override
   Widget build(BuildContext context) {
     super.build(context);
@@ -759,6 +860,15 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
     final theme = Theme.of(context);
     final colors = theme.colorScheme;
 
+    // Optional: show sun az/alt for this place/time
+    final mapState = Provider.of<MapState>(context, listen: false);
+    final dt = mapState.selectedDateTime;
+    final lat = place.location.coordinates.lat.toDouble();
+    final lng = place.location.coordinates.lng.toDouble();
+    final sun = SunUtils.getSunPosition(dt, lat, lng);
+    final altDeg = (sun['altitude']! * SunUtils.deg);
+    final azDeg  = (sun['azimuth']! * SunUtils.deg);
+
     showDialog(
       context: context,
       barrierDismissible: true,
@@ -776,6 +886,11 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
               const SizedBox(height: 8),
               Text(
                 "Coordinates: (${place.location.coordinates.lat.toStringAsFixed(5)}, ${place.location.coordinates.lng.toStringAsFixed(5)})",
+                style: theme.textTheme.bodySmall?.copyWith(color: colors.onSurfaceVariant),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                "Sun now: ${altDeg.toStringAsFixed(1)}° alt · ${azDeg.toStringAsFixed(0)}° az",
                 style: theme.textTheme.bodySmall?.copyWith(color: colors.onSurfaceVariant),
               ),
               if (kDebugMode) ...[
@@ -843,6 +958,7 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
   }
 }
 
+/// Custom Click Listener for Mapbox Point Annotations.
 class AnnotationClickListener extends OnPointAnnotationClickListener {
   final Function(PointAnnotation) onAnnotationClick;
   AnnotationClickListener({required this.onAnnotationClick});
