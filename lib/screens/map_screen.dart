@@ -1,3 +1,4 @@
+// screens/map_screen.dart
 import 'dart:async';
 import 'dart:math' as math;
 import 'dart:typed_data';
@@ -15,13 +16,15 @@ import '../models/building.dart';
 import '../utils/sun_utils.dart';
 import '../providers/map_state.dart';
 
-// NEW
+// Cities
 import '../models/city.dart';
 import '../data/slovenia_cities.dart';
 
+// Terrain horizon (provided elsewhere with your private token/config)
+import '../services/terrain_elevation_service.dart';
+
 class MapScreen extends StatefulWidget {
   const MapScreen({super.key});
-
   @override
   State<MapScreen> createState() => _MapScreenState();
 }
@@ -31,7 +34,6 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
   PointAnnotationManager? _pointAnnotationManager;
   PolygonAnnotationManager? _polygonManager;
 
-  // icon name -> PNG bytes (cached once at startup)
   final Map<String, Uint8List> _placeIconImages = {};
   bool _iconsLoaded = false;
 
@@ -40,25 +42,31 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
   CameraState? _previousIdleCameraState;
   bool _mapReady = false;
 
-  // For click handling
-  final Map<String, Place> _annotationIdToPlace = {}; // annotation.id -> Place
-
-  // Diffing for markers
-  final Map<String, PointAnnotation> _placeIdToAnnotation = {}; // placeId -> annotation
-  final Map<String, bool> _placeSunState = {};                  // placeId -> last in-sun state
-  String _iconScaleBucket = "";                                 // last zoom bucket
+  final Map<String, Place> _annotationIdToPlace = {};
+  final Map<String, PointAnnotation> _placeIdToAnnotation = {};
+  final Map<String, bool> _placeSunState = {};
+  String _iconScaleBucket = "";
 
   DateTime? _lastDrawTime;
   bool _isRedrawing = false;
 
-  // Sticky icons: keep markers within padded viewport
-  static const double _markerPadMeters = 350.0; // try 300–500m
-
-  // Safety cap for total annotations
+  // Sticky icons & budget
+  static const double _markerPadMeters = 350.0;
   static const int _kMaxAnnotations = 1200;
 
-  // NEW: current chosen city (nullable at start)
+  // City filter
   City? _selectedCity;
+
+  // Terrain horizon (optional)
+  TerrainElevationService? _elevService;     // injected via Provider if present
+  final bool _useTerrainHorizon = true;
+  final double _horizonMarginDeg = 0.5;      // conservative bump
+  final Map<String, double> _horizonCache = {}; // key: qLat,qLng,sector10 -> horizon angle (rad)
+
+  // ---- NEW: listen to MapState so we redraw when data lands ----
+  Timer? _stateRedrawTimer;
+  MapState? _mapStateRef;
+  VoidCallback? _mapStateListener;
 
   @override
   bool get wantKeepAlive => true;
@@ -70,31 +78,66 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
   }
 
   @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+
+    // Try to obtain TerrainElevationService if the app provided it.
+    _elevService ??= _tryGetTerrainService(context);
+
+    // Attach a listener to MapState so icons/shadows render as soon as data loads.
+    final ms = Provider.of<MapState>(context, listen: false);
+    if (_mapStateRef != ms) {
+      if (_mapStateRef != null && _mapStateListener != null) {
+        _mapStateRef!.removeListener(_mapStateListener!);
+      }
+      _mapStateRef = ms;
+      _mapStateListener = () {
+        _stateRedrawTimer?.cancel();
+        _stateRedrawTimer = Timer(const Duration(milliseconds: 60), () {
+          if (mounted && _mapReady && !_isRedrawing && _iconsLoaded) {
+            _tryRedraw("mapState listener");
+          }
+        });
+      };
+      _mapStateRef!.addListener(_mapStateListener!);
+    }
+
+    // Keep your time-change redraw
+    final mapState = context.watch<MapState>();
+    final currentTime = mapState.selectedDateTime;
+    if (_mapReady && !_isRedrawing && (_lastDrawTime == null || !_lastDrawTime!.isAtSameMomentAs(currentTime))) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && !_isRedrawing) _tryRedraw("time change");
+      });
+    }
+  }
+
+  TerrainElevationService? _tryGetTerrainService(BuildContext context) {
+    try {
+      return Provider.of<TerrainElevationService>(context, listen: false);
+    } catch (_) {
+      return null; // Provider not registered → terrain horizon disabled
+    }
+  }
+
+  @override
   void dispose() {
     _mapIdleTimer?.cancel();
+    _stateRedrawTimer?.cancel();
+    if (_mapStateRef != null && _mapStateListener != null) {
+      _mapStateRef!.removeListener(_mapStateListener!);
+    }
+
     _pointAnnotationManager = null;
     _polygonManager = null;
     _mapboxMap = null;
+
     _placeIconImages.clear();
     _annotationIdToPlace.clear();
     _placeIdToAnnotation.clear();
     _placeSunState.clear();
+    _horizonCache.clear();
     super.dispose();
-  }
-
-  @override
-  void didChangeDependencies() {
-    super.didChangeDependencies();
-    final mapState = context.watch<MapState>();
-    final currentTime = mapState.selectedDateTime;
-
-    if (_mapReady && !_isRedrawing && (_lastDrawTime == null || !_lastDrawTime!.isAtSameMomentAs(currentTime))) {
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (mounted && !_isRedrawing) {
-          _tryRedraw("time change in didChangeDependencies");
-        }
-      });
-    }
   }
 
   Future<void> _loadIconImages() async {
@@ -108,8 +151,7 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
       try {
         final byteData = await rootBundle.load(entry.value);
         return MapEntry(entry.key, byteData.buffer.asUint8List());
-      } catch (e) {
-        if (kDebugMode) print("❌ MapScreen: Error loading icon '${entry.value}': $e");
+      } catch (_) {
         return MapEntry(entry.key, Uint8List(0));
       }
     });
@@ -129,7 +171,7 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
 
     final mapState = Provider.of<MapState>(context, listen: false);
     final initialCenter = mapState.selectedPlace?.location
-        ?? Point(coordinates: Position(14.3310, 46.3895)); // Tržič approx
+        ?? Point(coordinates: Position(14.3310, 46.3895)); // Tržič approx.
     const initialZoom = 14.0;
 
     try {
@@ -144,7 +186,7 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
         }),
       );
     } catch (e) {
-      if (kDebugMode) print("❌ MapScreen: Error during map/annotation manager setup: $e");
+      if (kDebugMode) print("❌ MapScreen: setup error: $e");
     }
   }
 
@@ -152,20 +194,16 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
     if (!mounted) return;
     _mapReady = true;
 
-    // Reset diff caches on full map load (style might be recreated)
     _placeIdToAnnotation.clear();
     _placeSunState.clear();
     _annotationIdToPlace.clear();
     _iconScaleBucket = "";
 
     _updateLastCameraState().then((_) {
-      if (mounted && _lastCameraState != null) {
-        _previousIdleCameraState = _lastCameraState;
-        if (!_isRedrawing) {
-          _triggerDataFetch();
-          _tryRedraw("map loaded initial");
-        }
-      }
+      if (!mounted || _lastCameraState == null) return;
+      _previousIdleCameraState = _lastCameraState;
+      _triggerDataFetch();
+      _tryRedraw("map loaded");
     });
   }
 
@@ -175,30 +213,26 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
     _mapIdleTimer = Timer(const Duration(milliseconds: 700), () async {
       if (!mounted || !_mapReady || _isRedrawing) return;
 
-      final CameraState? atStart = _previousIdleCameraState;
+      final start = _previousIdleCameraState;
       await _updateLastCameraState();
       if (!mounted || _lastCameraState == null) return;
 
-      bool fetch = true;
-      bool redraw = true;
-
-      if (atStart != null) {
-        const dataPosTol = 0.00005; // ~5.5m
+      bool fetch = true, redraw = true;
+      if (start != null) {
+        const dataPosTol = 0.00005;
         const dataZoomTol = 0.05;
-        const arrowPosTol = 0.0001; // ~11m
+        const arrowPosTol = 0.0001;
 
-        final centerChangedForData =
-            (atStart.center.coordinates.lat - _lastCameraState!.center.coordinates.lat).abs() > dataPosTol ||
-                (atStart.center.coordinates.lng - _lastCameraState!.center.coordinates.lng).abs() > dataPosTol;
-        final zoomChangedForData = (atStart.zoom - _lastCameraState!.zoom).abs() > dataZoomTol;
+        final movedData =
+            (start.center.coordinates.lat - _lastCameraState!.center.coordinates.lat).abs() > dataPosTol ||
+                (start.center.coordinates.lng - _lastCameraState!.center.coordinates.lng).abs() > dataPosTol;
+        final zoomData = (start.zoom - _lastCameraState!.zoom).abs() > dataZoomTol;
+        if (!movedData && !zoomData) fetch = false;
 
-        if (!centerChangedForData && !zoomChangedForData) fetch = false;
-
-        final centerChangedForArrow =
-            (atStart.center.coordinates.lat - _lastCameraState!.center.coordinates.lat).abs() > arrowPosTol ||
-                (atStart.center.coordinates.lng - _lastCameraState!.center.coordinates.lng).abs() > arrowPosTol;
-
-        if (!centerChangedForArrow && !zoomChangedForData) redraw = false;
+        final movedArrow =
+            (start.center.coordinates.lat - _lastCameraState!.center.coordinates.lat).abs() > arrowPosTol ||
+                (start.center.coordinates.lng - _lastCameraState!.center.coordinates.lng).abs() > arrowPosTol;
+        if (!movedArrow && !zoomData) redraw = false;
       }
 
       if (fetch) _triggerDataFetch();
@@ -211,8 +245,7 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
     if (_mapboxMap == null || !mounted) return;
     try {
       _lastCameraState = await _mapboxMap!.getCameraState();
-    } catch (e) {
-      if (kDebugMode) print("❌ MapScreen: Error updating camera state: $e");
+    } catch (_) {
       _lastCameraState = null;
     }
   }
@@ -225,9 +258,7 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
       final bounds = await _mapboxMap!.coordinateBoundsForCamera(_lastCameraState!.toCameraOptions());
       mapState.fetchBuildingsForView(bounds, currentZoom);
       mapState.fetchPlacesForView(bounds, currentZoom);
-    } catch (e) {
-      if (kDebugMode) print("❌ MapScreen: Error in _triggerDataFetch: $e");
-    }
+    } catch (_) {}
   }
 
   void _moveCameraTo(Point center, {required double zoom}) {
@@ -238,31 +269,40 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
     );
   }
 
-  // ------------------ City jump ------------------
-
-  void _goToCity(City city) {
+  // ---------- City jump ----------
+  void _goToCity(City city) async {
     final mapState = Provider.of<MapState>(context, listen: false);
 
-    // Clear cached coverage so new area fetches immediately
+    // Clear caches so new area fetches immediately
     mapState.clearAllAccumulatedBuildingData();
     mapState.clearAllAccumulatedPlaceData();
 
     setState(() => _selectedCity = city);
 
-    final p = Point(coordinates: Position(city.lng, city.lat));
-    _moveCameraTo(p, zoom: city.zoom);
+    final targetCenter = Point(coordinates: Position(city.lng, city.lat));
+    final targetCam = CameraOptions(center: targetCenter, zoom: city.zoom, pitch: 15.0);
 
-    // Nudge fetch/redraw after the fly animation
+    // Prefetch for destination bounds so data is ready when we arrive
+    try {
+      if (_mapboxMap != null) {
+        final targetBounds = await _mapboxMap!.coordinateBoundsForCamera(targetCam);
+        mapState.fetchBuildingsForView(targetBounds, city.zoom);
+        mapState.fetchPlacesForView(targetBounds, city.zoom);
+      }
+    } catch (_) {}
+
+    // Fly the camera
+    _moveCameraTo(targetCenter, zoom: city.zoom);
+
+    // After fly finishes, make sure we redraw (listener will also fire when data arrives)
     Future.delayed(const Duration(milliseconds: 1700), () async {
       if (!mounted) return;
       await _updateLastCameraState();
-      _triggerDataFetch();
       _tryRedraw("city change → ${city.name}");
     });
   }
 
-  // ------------------ Helpers (bounds, scale, thinning) ------------------
-
+  // ---------- Helpers ----------
   bool _checkAabbIntersection(CoordinateBounds b1, CoordinateBounds b2) {
     if (b1.northeast.coordinates.lng < b2.southwest.coordinates.lng ||
         b2.northeast.coordinates.lng < b1.southwest.coordinates.lng) return false;
@@ -271,17 +311,13 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
     return true;
   }
 
-  bool _isPointInBounds(Position point, CoordinateBounds bounds, {bool inclusive = true}) {
-    final double lat = point.lat.toDouble();
-    final double lng = point.lng.toDouble();
-    final double minLat = bounds.southwest.coordinates.lat.toDouble();
-    final double maxLat = bounds.northeast.coordinates.lat.toDouble();
-    final double minLng = bounds.southwest.coordinates.lng.toDouble();
-    final double maxLng = bounds.northeast.coordinates.lng.toDouble();
-
-    if (inclusive) {
-      return lat >= minLat && lat <= maxLat && lng >= minLng && lng <= maxLng;
-    }
+  bool _isPointInBounds(Position p, CoordinateBounds b, {bool inclusive = true}) {
+    final lat = p.lat.toDouble(), lng = p.lng.toDouble();
+    final minLat = b.southwest.coordinates.lat.toDouble();
+    final maxLat = b.northeast.coordinates.lat.toDouble();
+    final minLng = b.southwest.coordinates.lng.toDouble();
+    final maxLng = b.northeast.coordinates.lng.toDouble();
+    if (inclusive) return lat >= minLat && lat <= maxLat && lng >= minLng && lng <= maxLng;
     return lat > minLat && lat < maxLat && lng > minLng && lng < maxLng;
   }
 
@@ -291,7 +327,6 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
     if (z < 17.0) return 0.85;
     return 1.0;
   }
-
   String _bucketForZoom(double z) {
     if (z < 14.0) return "S";
     if (z < 15.5) return "M";
@@ -314,6 +349,14 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
     );
   }
 
+  // Terrain-horizon cache key: quantize lat/lng + 10° azimuth bucket
+  String _hKey(double lat, double lng, double azRad) {
+    final sector = ((azRad * SunUtils.deg) / 10.0).round() * 10; // 10°
+    final qLat = (lat * 200).round() / 200.0; // ~0.005°
+    final qLng = (lng * 200).round() / 200.0;
+    return "$qLat,$qLng,$sector";
+  }
+
   List<int> _thinByGrid(List<PointAnnotationOptions> opts, int targetCount) {
     if (opts.length <= targetCount) {
       return List<int>.generate(opts.length, (i) => i);
@@ -325,7 +368,6 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
 
     double _norm(double v, double a, double b) => ((v - a) / (b - a + 1e-12)).clamp(0.0, 0.9999);
 
-    // Envelope of batch
     double minLat = double.infinity, maxLat = -double.infinity;
     double minLng = double.infinity, maxLng = -double.infinity;
     for (final o in opts) {
@@ -336,7 +378,6 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
       maxLng = math.max(maxLng, p.lng.toDouble());
     }
 
-    // One per cell, then fill remainder
     for (int i = 0; i < opts.length; i++) {
       final p = (opts[i].geometry as Point).coordinates;
       final c = (_norm(p.lng.toDouble(), minLng, maxLng) * grid).floor();
@@ -355,16 +396,11 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
     return chosen.toList()..sort();
   }
 
-  // ------------------ Redraw pipeline (same as before) ------------------
-
+  // ---------- Redraw ----------
   Future<void> _tryRedraw(String source) async {
-    if (_isRedrawing) {
-      if (kDebugMode) print("ℹ️ MapScreen: Redraw skipped (already running) — source: $source");
-      return;
-    }
+    if (_isRedrawing) return;
     if (!mounted || _mapboxMap == null || !_mapReady || !_iconsLoaded ||
         _polygonManager == null || _pointAnnotationManager == null || _lastCameraState == null) {
-      if (kDebugMode) print("ℹ️ MapScreen: Redraw skipped (not ready) — source: $source");
       return;
     }
 
@@ -382,13 +418,9 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
       final shadowLogic = await _calculateAndDrawBuildingShadows(buildings, dateTime, bounds);
       await _drawPlaces(places, buildings, dateTime, shadowLogic, bounds);
     } catch (e, s) {
-      if (kDebugMode && mounted) {
-        print("❌ MapScreen: Redraw error: $e\n$s");
-      }
+      if (kDebugMode) print("❌ Redraw error: $e\n$s");
     } finally {
-      if (mounted) {
-        _isRedrawing = false;
-      }
+      _isRedrawing = false;
     }
   }
 
@@ -401,25 +433,26 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
 
     try { await _polygonManager!.deleteAll(); } catch (_) {}
 
-    final sunPosCenter = SunUtils.getSunPosition(
+    final sunPos = SunUtils.getSunPosition(
       dateTime,
       _lastCameraState!.center.coordinates.lat.toDouble(),
       _lastCameraState!.center.coordinates.lng.toDouble(),
     );
-    final double sunAltitudeRad = sunPosCenter['altitude']!;
-    final double sunAzimuth_N_CW_rad = sunPosCenter['azimuth']!;
+    final alt = sunPos['altitude']!;
+    final az  = sunPos['azimuth']!;
 
-    final Map<String, List<Position>> calculatedShadowsForLogic = {};
-    final List<PolygonAnnotationOptions> draw = [];
+    final calculated = <String, List<Position>>{};
+    final draw = <PolygonAnnotationOptions>[];
 
-    if (sunAltitudeRad <= SunUtils.altitudeThresholdRad) {
+    if (alt <= SunUtils.altitudeThresholdRad) {
       for (final b in allLoadedBuildings) {
-        calculatedShadowsForLogic.putIfAbsent(b.id, () => []);
+        calculated.putIfAbsent(b.id, () => []);
       }
-      return calculatedShadowsForLogic;
+      return calculated;
     }
 
-    final altDeg = sunAltitudeRad * SunUtils.deg;
+    // opacity curve
+    final altDeg = alt * SunUtils.deg;
     const double maxShadowOpacity = 0.22;
     const double horizonFadeEndAlt = SunUtils.altitudeThresholdRad * SunUtils.deg + 0.5;
     const double horizonFadeStartAlt = 5.0;
@@ -444,18 +477,15 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
 
     if (baseOpacity <= 0.005) {
       for (final b in allLoadedBuildings) {
-        calculatedShadowsForLogic.putIfAbsent(b.id, () => []);
+        calculated.putIfAbsent(b.id, () => []);
       }
-      return calculatedShadowsForLogic;
+      return calculated;
     }
 
     final zoom = _lastCameraState!.zoom;
     final centerLat = _lastCameraState!.center.coordinates.lat.toDouble();
     final mpp = SunUtils.metersPerPixel(centerLat, zoom);
-    final double minShadowMeters = math.max(0.5, mpp * 1.2);
-
-    final zoomFactor = ((zoom - 12.0) / 5.0).clamp(0.0, 1.0);
-    final zoomOpacityAdj = 0.65 + 0.35 * zoomFactor;
+    final minShadowMeters = math.max(0.5, mpp * 1.2);
 
     final sw = currentViewportBounds.southwest.coordinates;
     final ne = currentViewportBounds.northeast.coordinates;
@@ -467,19 +497,20 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
 
     for (final b in allLoadedBuildings) {
       if (!_checkAabbIntersection(b.bounds, currentViewportBounds)) {
-        calculatedShadowsForLogic[b.id] = [];
+        calculated[b.id] = [];
         continue;
       }
 
       final poly = SunUtils.calculateBuildingShadow(
         building: b,
-        sunAzimuth_N_CW_rad: sunAzimuth_N_CW_rad,
-        sunAltitudeRad: sunAltitudeRad,
+        sunAzimuth_N_CW_rad: az,
+        sunAltitudeRad: alt,
         minDrawableShadowMeters: minShadowMeters,
       );
-      calculatedShadowsForLogic[b.id] = poly.isNotEmpty ? List<Position>.from(poly) : [];
+      calculated[b.id] = poly.isNotEmpty ? List<Position>.from(poly) : [];
       if (poly.length < 3) continue;
 
+      // overlap attenuation
       double cLat = 0, cLng = 0;
       for (final p in poly) { cLat += p.lat.toDouble(); cLng += p.lng.toDouble(); }
       cLat /= poly.length; cLng /= poly.length;
@@ -488,7 +519,7 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
       final seen = density[row][col];
 
       final overlapFactor = 1.0 / (1.0 + seen);
-      final op = (baseOpacity * zoomOpacityAdj * overlapFactor).clamp(0.03, 0.16);
+      final op = (baseOpacity * overlapFactor).clamp(0.03, 0.16);
 
       List<Position> hole = [];
       if (b.polygon.isNotEmpty) {
@@ -500,27 +531,21 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
       final rings = <List<Position>>[poly];
       if (hole.isNotEmpty) rings.add(hole);
 
-      draw.add(
-        PolygonAnnotationOptions(
-          geometry: Polygon(coordinates: rings),
-          fillColor: baseShadowColor.withOpacity(op).value,
-          fillOutlineColor: Colors.transparent.value,
-          fillSortKey: 0,
-        ),
-      );
+      draw.add(PolygonAnnotationOptions(
+        geometry: Polygon(coordinates: rings),
+        fillColor: baseShadowColor.withOpacity(op).value,
+        fillOutlineColor: Colors.transparent.value,
+        fillSortKey: 0,
+      ));
 
       density[row][col] = seen + 1;
     }
 
-    try {
-      if (draw.isNotEmpty) {
-        await _polygonManager!.createMulti(draw);
-      }
-    } catch (e) {
-      if (kDebugMode) print("ℹ️ MapScreen: createMulti(shadows) error: $e");
+    if (draw.isNotEmpty) {
+      try { await _polygonManager!.createMulti(draw); } catch (_) {}
     }
 
-    return calculatedShadowsForLogic;
+    return calculated;
   }
 
   Future<void> _drawPlaces(
@@ -537,122 +562,146 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
     final String newBucket = _bucketForZoom(zoom);
 
     final paddedBounds = _padBounds(currentViewportBounds, _markerPadMeters);
-    final relevantBuildings =
-    allLoadedBuildings.where((b) => _checkAabbIntersection(b.bounds, paddedBounds)).toList();
+
+    final relevantBuildings = allLoadedBuildings
+        .where((b) => _checkAabbIntersection(b.bounds, paddedBounds))
+        .toList();
 
     final visiblePlaceIds = <String>{};
-    final toDelete = <PointAnnotation>[];
-    final toDeletePlaceIds = <String>[];
-    final toCreate = <PointAnnotationOptions>[];
-    final placesForCreatedAnnotations = <Place>[];
-    final newSunState = <String, bool>{};
+    final visiblePlaces = <Place>[];
+    final rawSunState = <String, bool>{};
+
+    int horizonBudget = 12; // limit new terrain samples per frame
 
     for (final place in allLoadedPlaces) {
-      if (!_isPointInBounds(place.location.coordinates, paddedBounds, inclusive: true)) continue;
+      final pos = place.location.coordinates;
+      if (!_isPointInBounds(pos, paddedBounds, inclusive: true)) continue;
+
       visiblePlaceIds.add(place.id);
+      visiblePlaces.add(place);
 
-      final placeLat = place.location.coordinates.lat.toDouble();
-      final placeLng = place.location.coordinates.lng.toDouble();
+      final lat = pos.lat.toDouble();
+      final lng = pos.lng.toDouble();
 
-      final sunPos = SunUtils.getSunPosition(dateTime, placeLat, placeLng);
-      final double altRad = sunPos['altitude']!;
-      final double azRad = sunPos['azimuth']!;
+      final sun = SunUtils.getSunPosition(dateTime, lat, lng);
+      final altRad = sun['altitude']!;
+      final azRad  = sun['azimuth']!;
 
-      bool isDirectSun, isEffectiveSun;
-      String? hostId;
-
-      for (final b in relevantBuildings) {
-        if (b.polygon.length >= 3 && SunUtils.isPointInPolygon(place.location.coordinates, b.polygon)) {
-          hostId = b.id; break;
-        }
-      }
+      bool isEffectiveSun = false;
 
       if (altRad > SunUtils.altitudeThresholdRad) {
-        isDirectSun = !SunUtils.isPlaceInShadow(
-          placePosition: place.location.coordinates,
-          sunAzimuth_N_CW_rad: azRad,
-          sunAltitudeRad: altRad,
-          potentialBlockers: relevantBuildings,
-          buildingShadows: calculatedShadowsForLogic,
-          ignoreBuildingId: hostId,
-        );
+        bool terrainBlocks = false;
+        if (_useTerrainHorizon && _elevService != null) {
+          final key = _hKey(lat, lng, azRad);
+          double? hor = _horizonCache[key];
+          if (hor == null && horizonBudget > 0) {
+            try {
+              hor = await SunUtils.horizonAngleRad(
+                lat, lng, azRad,
+                sampleElevationM: _elevService!.sampleElevationM,
+              );
+              _horizonCache[key] = hor;
+              horizonBudget--;
+            } catch (_) {}
+          }
+          if (hor != null) {
+            final margin = _horizonMarginDeg * SunUtils.rad;
+            if (altRad < hor + margin) terrainBlocks = true;
+          }
+        }
 
-        isEffectiveSun = isDirectSun;
-        if (isDirectSun) {
-          int shadowedNeighbors = 0;
-          const double d = 2.5;
-          const int need = 3;
-
-          final dLat = SunUtils.metersToLat(d);
-          final dLng = SunUtils.metersToLng(d, placeLat);
-          final probes = <Position>[
-            Position(placeLng, placeLat + dLat),
-            Position(placeLng + dLng, placeLat),
-            Position(placeLng, placeLat - dLat),
-            Position(placeLng - dLng, placeLat),
-          ];
-          for (final p in probes) {
-            if (SunUtils.isPlaceInShadow(
-              placePosition: p,
-              sunAzimuth_N_CW_rad: azRad,
-              sunAltitudeRad: altRad,
-              potentialBlockers: relevantBuildings,
-              buildingShadows: calculatedShadowsForLogic,
-              ignoreBuildingId: null,
-              checkRadiusMeters: 0.25,
-              insideHostBuildingCheckRadiusMeters: 0.25,
-            )) {
-              shadowedNeighbors++;
+        if (!terrainBlocks) {
+          String? hostId;
+          for (final b in relevantBuildings) {
+            if (b.polygon.length >= 3 && SunUtils.isPointInPolygon(pos, b.polygon)) {
+              hostId = b.id;
+              break;
             }
           }
-          if (shadowedNeighbors >= need) isEffectiveSun = false;
+
+          final blocked = SunUtils.isPlaceInShadow(
+            placePosition: pos,
+            sunAzimuth_N_CW_rad: azRad,
+            sunAltitudeRad: altRad,
+            potentialBlockers: relevantBuildings,
+            buildingShadows: calculatedShadowsForLogic,
+            ignoreBuildingId: hostId,
+          );
+          isEffectiveSun = !blocked;
+
+          if (isEffectiveSun) {
+            int shadowedNeighbors = 0;
+            const d = 2.5; // meters
+            const need = 3;
+
+            final dLat = SunUtils.metersToLat(d);
+            final dLng = SunUtils.metersToLng(d, lat);
+            final probes = <Position>[
+              Position(lng,        lat + dLat),
+              Position(lng + dLng, lat        ),
+              Position(lng,        lat - dLat),
+              Position(lng - dLng, lat        ),
+            ];
+            for (final p in probes) {
+              final neighborBlocked = SunUtils.isPlaceInShadow(
+                placePosition: p,
+                sunAzimuth_N_CW_rad: azRad,
+                sunAltitudeRad: altRad,
+                potentialBlockers: relevantBuildings,
+                buildingShadows: calculatedShadowsForLogic,
+                ignoreBuildingId: null,
+                checkRadiusMeters: 0.25,
+                insideHostBuildingCheckRadiusMeters: 0.25,
+              );
+              if (neighborBlocked) shadowedNeighbors++;
+            }
+            if (shadowedNeighbors >= need) isEffectiveSun = false;
+          }
+        } else {
+          isEffectiveSun = false;
         }
       } else {
-        isDirectSun = false;
         isEffectiveSun = false;
       }
 
-      newSunState[place.id] = isEffectiveSun;
+      rawSunState[place.id] = isEffectiveSun;
+    }
 
-      final iconKey = SunUtils.getIconPath(place.type, isEffectiveSun);
-      final bytes = _placeIconImages[iconKey];
-      if (bytes == null || bytes.isEmpty) continue;
+    // Smooth close-by same-type icons for visual consistency
+    final smoothed = SunUtils.smoothIconStatesByLocalConsensus(
+      places: visiblePlaces,
+      initialSunState: rawSunState,
+      radiusMeters: 10.0,
+      minNeighbors: 1,
+      requiredFraction: 0.66,
+    );
 
+    // 1) remove annotations that are now outside padded viewport
+    final toDelete = <PointAnnotation>[];
+    final toDeletePlaceIds = <String>[];
+
+    for (final entry in _placeIdToAnnotation.entries.toList()) {
+      final pid = entry.key;
+      final ann = entry.value;
+      final pt = ann.geometry.coordinates;
+      if (!visiblePlaceIds.contains(pid) || !_isPointInBounds(pt, paddedBounds, inclusive: true)) {
+        toDelete.add(ann);
+        toDeletePlaceIds.add(pid);
+      }
+    }
+
+    // 2) remove + recreate if sun state or scale changed
+    for (final place in visiblePlaces) {
+      final newInSun = smoothed[place.id] ?? false;
       final had = _placeIdToAnnotation.containsKey(place.id);
       final bucketChanged = (_iconScaleBucket != newBucket);
-      final sunChanged = (_placeSunState[place.id] != isEffectiveSun);
-
-      if (!had || bucketChanged || sunChanged) {
+      final sunChanged = (_placeSunState[place.id] != newInSun);
+      if (had && (bucketChanged || sunChanged)) {
         final existing = _placeIdToAnnotation[place.id];
         if (existing != null) {
           toDelete.add(existing);
           toDeletePlaceIds.add(place.id);
         }
-        toCreate.add(PointAnnotationOptions(
-          geometry: place.location,
-          image: bytes,
-          iconSize: iconScale,
-          iconAnchor: IconAnchor.BOTTOM,
-          iconOffset: [0.0, -2.0 * iconScale],
-          symbolSortKey: 10,
-        ));
-        placesForCreatedAnnotations.add(place);
-      }
-    }
-
-    // remove those no longer in padded viewport
-    final gone = _placeIdToAnnotation.keys.where((id) {
-      final ann = _placeIdToAnnotation[id];
-      if (ann == null) return true;
-      final pt = ann.geometry.coordinates;
-      return !_isPointInBounds(pt, paddedBounds, inclusive: true);
-    }).toList();
-
-    for (final pid in gone) {
-      final ann = _placeIdToAnnotation[pid];
-      if (ann != null) {
-        toDelete.add(ann);
-        toDeletePlaceIds.add(pid);
       }
     }
 
@@ -665,58 +714,82 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
         for (final ann in toDelete) {
           await _pointAnnotationManager!.delete(ann);
         }
-      } catch (e) {
-        if (kDebugMode) print("ℹ️ MapScreen: delete error: $e");
-      }
+      } catch (_) {}
     }
 
-    // enforce cap with grid thinning for the batch
+    // 3) create new/updated annotations
+    final toCreate = <PointAnnotationOptions>[];
+    final placesForCreated = <Place>[];
+
+    for (final place in visiblePlaces) {
+      final newInSun = smoothed[place.id] ?? false;
+
+      final needCreate = !_placeIdToAnnotation.containsKey(place.id) ||
+          (_placeSunState[place.id] != newInSun) ||
+          (_iconScaleBucket != newBucket);
+
+      if (!needCreate) continue;
+
+      final iconKey = SunUtils.getIconPath(place.type, newInSun);
+      final bytes = _placeIconImages[iconKey];
+      if (bytes == null || bytes.isEmpty) continue;
+
+      toCreate.add(PointAnnotationOptions(
+        geometry: place.location,
+        image: bytes,
+        iconSize: iconScale,
+        iconAnchor: IconAnchor.BOTTOM,
+        iconOffset: [0.0, -2.0 * iconScale],
+        symbolSortKey: 10,
+      ));
+      placesForCreated.add(place);
+    }
+
+    // Cap + thin
     if (toCreate.isNotEmpty) {
       final existingCount = _placeIdToAnnotation.length;
       final budget = (_kMaxAnnotations - existingCount).clamp(0, _kMaxAnnotations);
       if (budget <= 0) {
         toCreate.clear();
-        placesForCreatedAnnotations.clear();
+        placesForCreated.clear();
       } else if (toCreate.length > budget) {
         final keepIdx = _thinByGrid(toCreate, budget);
-        final filteredCreate = <PointAnnotationOptions>[];
+        final filteredOpts = <PointAnnotationOptions>[];
         final filteredPlaces = <Place>[];
-        for (final idx in keepIdx) {
-          filteredCreate.add(toCreate[idx]);
-          filteredPlaces.add(placesForCreatedAnnotations[idx]);
+        for (final i in keepIdx) {
+          filteredOpts.add(toCreate[i]);
+          filteredPlaces.add(placesForCreated[i]);
         }
         toCreate
           ..clear()
-          ..addAll(filteredCreate);
-        placesForCreatedAnnotations
+          ..addAll(filteredOpts);
+        placesForCreated
           ..clear()
           ..addAll(filteredPlaces);
       }
     }
 
     if (toCreate.isNotEmpty) {
-      try {
-        final created = await _pointAnnotationManager!.createMulti(toCreate);
-        for (int i = 0; i < created.length; i++) {
-          final ann = created[i];
-          final place = placesForCreatedAnnotations[i];
+      // create one-by-one to maintain mapping
+      for (int i = 0; i < toCreate.length; i++) {
+        try {
+          final ann = await _pointAnnotationManager!.create(toCreate[i]);
+          final place = placesForCreated[i];
           if (ann != null) {
             _placeIdToAnnotation[place.id] = ann;
             _annotationIdToPlace[ann.id] = place;
           }
-        }
-      } catch (e) {
-        if (kDebugMode) print("ℹ️ MapScreen: createMulti error: $e");
+        } catch (_) {}
       }
     }
 
     _placeSunState
       ..clear()
-      ..addAll(newSunState);
+      ..addAll(smoothed);
     _iconScaleBucket = newBucket;
   }
 
-  // ------------------ UI ------------------
+  // ---------- UI ----------
   @override
   Widget build(BuildContext context) {
     super.build(context);
@@ -833,7 +906,7 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
             ),
           ),
 
-          // City filter chip (under the arrow)
+          // City filter chip
           Positioned(
             top: 68, right: 16,
             child: SafeArea(
@@ -884,8 +957,15 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
     final lat = place.location.coordinates.lat.toDouble();
     final lng = place.location.coordinates.lng.toDouble();
     final sun = SunUtils.getSunPosition(dt, lat, lng);
-    final altDeg = (sun['altitude']! * SunUtils.deg);
-    final azDeg  = (sun['azimuth']! * SunUtils.deg);
+    final altDeg = (sun['altitude']! * SunUtils.deg).toStringAsFixed(1);
+    final azDeg  = (sun['azimuth']! * SunUtils.deg).toStringAsFixed(0);
+
+    double? horizonDeg;
+    if (_useTerrainHorizon && _elevService != null) {
+      final key = _hKey(lat, lng, sun['azimuth']!);
+      final hor = _horizonCache[key];
+      if (hor != null) horizonDeg = hor * SunUtils.deg;
+    }
 
     showDialog(
       context: context,
@@ -902,24 +982,14 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
               Text("Type: ${place.type.name.toUpperCase()}",
                   style: theme.textTheme.labelLarge?.copyWith(color: colors.onSurfaceVariant)),
               const SizedBox(height: 8),
-              Text(
-                "Coordinates: (${place.location.coordinates.lat.toStringAsFixed(5)}, ${place.location.coordinates.lng.toStringAsFixed(5)})",
-                style: theme.textTheme.bodySmall?.copyWith(color: colors.onSurfaceVariant),
-              ),
+              Text("Sun now: $altDeg° alt · $azDeg° az",
+                  style: theme.textTheme.bodySmall?.copyWith(color: colors.onSurfaceVariant)),
+              if (horizonDeg != null)
+                Text("Local horizon: ${horizonDeg.toStringAsFixed(1)}°",
+                    style: theme.textTheme.bodySmall?.copyWith(color: colors.onSurfaceVariant)),
               const SizedBox(height: 8),
-              Text(
-                "Sun now: ${altDeg.toStringAsFixed(1)}° alt · ${azDeg.toStringAsFixed(0)}° az",
-                style: theme.textTheme.bodySmall?.copyWith(color: colors.onSurfaceVariant),
-              ),
-              if (kDebugMode) ...[
-                const SizedBox(height: 4),
-                Text("ID: ${place.id}",
-                    style: theme.textTheme.bodySmall?.copyWith(
-                        color: colors.onSurfaceVariant.withOpacity(0.7), fontSize: 10)),
-              ],
-              const SizedBox(height: 20),
-              Text("Open in Maps for navigation?",
-                  style: theme.textTheme.bodyMedium?.copyWith(color: colors.onSurface)),
+              Text("(${place.location.coordinates.lat.toStringAsFixed(5)}, ${place.location.coordinates.lng.toStringAsFixed(5)})",
+                  style: theme.textTheme.bodySmall?.copyWith(color: colors.onSurfaceVariant)),
             ],
           ),
         ),
@@ -941,29 +1011,36 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
     );
   }
 
-  void _launchNavigation(Place place) async {
+  // Robust navigation launcher for Android & iOS
+  Future<void> _launchNavigation(Place place) async {
     final lat = place.location.coordinates.lat;
     final lng = place.location.coordinates.lng;
-    final encodedName = Uri.encodeComponent(place.name);
+    final label = Uri.encodeComponent(place.name);
 
-    final uris = <Uri>[];
-    if (defaultTargetPlatform == TargetPlatform.iOS) {
-      uris.add(Uri.parse("maps://?q=$encodedName&ll=$lat,$lng&z=16"));
-      uris.add(Uri.parse("comgooglemaps://?q=$encodedName&center=$lat,$lng&zoom=16"));
-    } else if (defaultTargetPlatform == TargetPlatform.android) {
-      uris.add(Uri.parse("google.navigation:q=$lat,$lng&mode=d"));
-      uris.add(Uri.parse("geo:$lat,$lng?q=$lat,$lng($encodedName)"));
+    final candidates = <Uri>[];
+
+    if (defaultTargetPlatform == TargetPlatform.android) {
+      // Prefer Google Maps app
+      candidates.add(Uri.parse("google.navigation:q=$lat,$lng&mode=d"));
+      // geo URI with a label (will open Maps if available)
+      candidates.add(Uri.parse("geo:0,0?q=$lat,$lng($label)"));
+    } else if (defaultTargetPlatform == TargetPlatform.iOS) {
+      // Google Maps app on iOS
+      candidates.add(Uri.parse("comgooglemaps://?daddr=$lat,$lng&directionsmode=driving"));
+      // Apple Maps fallback
+      candidates.add(Uri.parse("maps://?daddr=$lat,$lng&dirflg=d"));
     }
-    uris.add(Uri.parse("https://www.google.com/maps/search/?api=1&query=$lat,$lng"));
-    uris.add(Uri.parse("https://www.google.com/maps/@?api=1&map_action=map&center=$lat,$lng&zoom=16"));
-    uris.add(Uri.parse("https://maps.apple.com/?q=$encodedName&ll=$lat,$lng&z=16"));
 
-    for (final uri in uris) {
+    // Universal HTTP fallback (browser if no app)
+    candidates.add(Uri.parse("https://www.google.com/maps/dir/?api=1&destination=$lat,$lng&travelmode=driving"));
+
+    for (final uri in candidates) {
       try {
-        if (await canLaunchUrl(uri) && await launchUrl(uri, mode: LaunchMode.externalApplication)) {
-          return;
-        }
-      } catch (_) {}
+        final ok = await launchUrl(uri, mode: LaunchMode.externalApplication);
+        if (ok) return;
+      } catch (_) {
+        // keep trying next candidate
+      }
     }
 
     if (!mounted) return;
@@ -980,21 +1057,15 @@ class AnnotationClickListener extends OnPointAnnotationClickListener {
   final Function(PointAnnotation) onAnnotationClick;
   AnnotationClickListener({required this.onAnnotationClick});
   @override
-  void onPointAnnotationClick(PointAnnotation annotation) {
-    onAnnotationClick(annotation);
-  }
+  void onPointAnnotationClick(PointAnnotation annotation) => onAnnotationClick(annotation);
 }
 
-// --------- UI piece for the city filter ---------
-
+// --------- City filter UI ---------
 class _CityFilterChip extends StatelessWidget {
   final String selected;
   final ValueChanged<City> onPick;
 
-  const _CityFilterChip({
-    required this.selected,
-    required this.onPick,
-  });
+  const _CityFilterChip({required this.selected, required this.onPick});
 
   @override
   Widget build(BuildContext context) {
@@ -1009,26 +1080,17 @@ class _CityFilterChip extends StatelessWidget {
       child: PopupMenuButton<City>(
         tooltip: 'Pick a city',
         onSelected: onPick,
-        itemBuilder: (ctx) {
-          return slovenianCities
-              .map((c) => PopupMenuItem<City>(
-            value: c,
-            child: Text(c.name),
-          ))
-              .toList();
-        },
+        itemBuilder: (ctx) => slovenianCities
+            .map((c) => PopupMenuItem<City>(value: c, child: Text(c.name))).toList(),
         child: Padding(
           padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const Icon(Icons.location_city_rounded, size: 18),
-              const SizedBox(width: 8),
-              Text(selected, style: TextStyle(color: colors.onSurface)),
-              const SizedBox(width: 4),
-              const Icon(Icons.arrow_drop_down),
-            ],
-          ),
+          child: Row(mainAxisSize: MainAxisSize.min, children: [
+            const Icon(Icons.location_city_rounded, size: 18),
+            const SizedBox(width: 8),
+            Text(selected, style: TextStyle(color: colors.onSurface)),
+            const SizedBox(width: 4),
+            const Icon(Icons.arrow_drop_down),
+          ]),
         ),
       ),
     );

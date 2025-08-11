@@ -1,10 +1,9 @@
+// lib/services/terrain_elevation_service.dart
 import 'dart:math' as math;
 import 'package:http/http.dart' as http;
 import 'package:image/image.dart' as img;
 
-/// Fast elevation sampler using Mapbox Terrain-RGB tiles.
-/// https://docs.mapbox.com/help/troubleshooting/access-elevation-data/
-/// elevation(m) = -10000 + (R*256*256 + G*256 + B) * 0.1
+
 class TerrainElevationService {
   TerrainElevationService({
     required this.mapboxToken,
@@ -20,6 +19,11 @@ class TerrainElevationService {
 
   final _cache = <String, _Tile>{};
   final _lru = <String>[]; // naive LRU list
+
+  void dispose() {
+    _cache.clear();
+    _lru.clear();
+  }
 
   Future<double?> sampleElevationM(double lat, double lon) async {
     final z = zoom;
@@ -38,21 +42,19 @@ class TerrainElevationService {
 
     final size = tile.size; // 256 or 512
 
-    // local pixel coords in the tile (0..size)
     final px = ((xFloat - x) * size).clamp(0.0, size.toDouble() - 1e-6);
     final py = ((yFloat - y) * size).clamp(0.0, size.toDouble() - 1e-6);
 
-    // bilinear sample
     final x0 = px.floor(), y0 = py.floor();
     final x1 = (x0 + 1).clamp(0, size - 1);
     final y1 = (y0 + 1).clamp(0, size - 1);
     final fx = px - x0;
     final fy = py - y0;
 
-    double v00 = _elevAt(tile.image!, x0, y0);
-    double v10 = _elevAt(tile.image!, x1, y0);
-    double v01 = _elevAt(tile.image!, x0, y1);
-    double v11 = _elevAt(tile.image!, x1, y1);
+    final v00 = _elevAt(tile.image!, x0, y0);
+    final v10 = _elevAt(tile.image!, x1, y0);
+    final v01 = _elevAt(tile.image!, x0, y1);
+    final v11 = _elevAt(tile.image!, x1, y1);
 
     final v0 = v00 * (1 - fx) + v10 * fx;
     final v1 = v01 * (1 - fx) + v11 * fx;
@@ -60,7 +62,6 @@ class TerrainElevationService {
   }
 
   Future<_Tile> _loadTile(int z, int x, int y, String key) async {
-    // Evict if needed
     if (_cache.length >= maxTilesInCache) {
       final victim = _lru.isNotEmpty ? _lru.removeAt(0) : null;
       if (victim != null) _cache.remove(victim);
@@ -85,21 +86,16 @@ class TerrainElevationService {
       }
     } catch (_) {}
 
-    final tile = _Tile(key: key, image: null, size: useHiDpi ? 512 : 256);
-    _cache[key] = tile;
+    final fallback = _Tile(key: key, image: null, size: useHiDpi ? 512 : 256);
+    _cache[key] = fallback;
     _lru.add(key);
-    return tile;
+    return fallback;
   }
 
-  // Decode Mapbox Terrain-RGB to elevation meters
   double _elevAt(img.Image image, int x, int y) {
-    // Image 4.x: getPixel returns Pixel with r/g/b/a channels
-    final p = image.getPixel(x, y);
-    final r = p.r;
-    final g = p.g;
-    final b = p.b;
-    final e = -10000.0 + (r * 256.0 * 256.0 + g * 256.0 + b) * 0.1;
-    return e;
+    final p = image.getPixel(x, y); // image ^4.x
+    final r = p.r, g = p.g, b = p.b;
+    return -10000.0 + (r * 256.0 * 256.0 + g * 256.0 + b) * 0.1;
   }
 }
 

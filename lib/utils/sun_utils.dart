@@ -47,8 +47,10 @@ Map<String, double> _getSunEphemeris(double jdUt) {
   final deltaSunRad = math.asin(math.sin(epsilonRad) * math.sin(lambdaSunTrueRad));
 
   final gmstDeg = _normalizeAngleDeg(
-    280.46061837 + 360.985647366289 * dJ2000
-        + 0.000387933 * tJc * tJc - tJc * tJc * tJc / 38710000.0,
+    280.46061837 +
+        360.985647366289 * dJ2000 +
+        0.000387933 * tJc * tJc -
+        tJc * tJc * tJc / 38710000.0,
   );
 
   return {
@@ -106,6 +108,7 @@ class SunUtils {
 
   static const double metersPerDegreeLat = 111320.0;
   static const double maxShadowLength = 1500.0;
+
   static const double altitudeThresholdRad = -0.833 * rad;
 
   static const double defaultInsideBuildingCheckRadiusMeters = 0.1;
@@ -128,9 +131,20 @@ class SunUtils {
   }
   static double metersToLat(double meters) => meters / metersPerDegreeLat;
 
-  /// Terrain horizon: maximum terrain elevation angle (rad) along azimuth.
+  static double haversineMeters(double lat1, double lng1, double lat2, double lng2) {
+    const R = 6371000.0;
+    final dLat = (lat2 - lat1) * rad;
+    final dLng = (lng2 - lng1) * rad;
+    final a = math.sin(dLat/2)*math.sin(dLat/2) +
+        math.cos(lat1*rad)*math.cos(lat2*rad)*math.sin(dLng/2)*math.sin(dLng/2);
+    final c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a));
+    return R * c;
+  }
+
   static Future<double> horizonAngleRad(
-      double lat, double lng, double azRad, {
+      double lat,
+      double lng,
+      double azRad, {
         required Future<double?> Function(double lat, double lng) sampleElevationM,
         double startStepM = 25.0,
         double maxDistM = 12000.0,
@@ -147,7 +161,7 @@ class SunUtils {
       if (z != null) {
         final ang = math.atan((z - z0) / d);
         if (ang > maxAng) maxAng = ang;
-        if (maxAng > (60.0 * rad)) break;
+        if (maxAng > (60.0 * rad)) break; // safety
       }
       d += step;
       step = math.min(step * 1.5, 400.0);
@@ -155,7 +169,6 @@ class SunUtils {
     return maxAng;
   }
 
-  /// Fast polygon test for “is this point within any precalculated shadow polygon”
   static bool isPointInPolygon(Position p, List<Position> poly) {
     if (poly.length < 3) return false;
     bool inside = false;
@@ -179,13 +192,12 @@ class SunUtils {
       }
 
       final xInt = (xj - xi) * (y - yi) / dy + xi;
-      if ((x - xInt).abs() < eps) return true;
+      if ((x - xInt).abs() < eps) return true; // on edge
       if (x < xInt) inside = !inside;
     }
     return inside;
   }
 
-  /// Shadow polygon using a stitched “ribbon” (base + shifted reversed)
   static List<Position> calculateBuildingShadow({
     required Building building,
     required double sunAzimuth_N_CW_rad,
@@ -231,7 +243,6 @@ class SunUtils {
     return ring;
   }
 
-  /// Full place-in-shadow test (uses precalculated polygons if provided + geometric fallback).
   static bool isPlaceInShadow({
     required Position placePosition,
     required double sunAzimuth_N_CW_rad,
@@ -285,20 +296,17 @@ class SunUtils {
       final dist2c = dXc * dXc + dYc * dYc;
       if (dist2c > searchDistance * searchDistance) continue;
 
-      // a) polygon shortcut if available
       final shadowPoly = buildingShadows[b.id];
       if (shadowPoly != null && shadowPoly.length >= 3) {
         for (final p in pts) {
           if (SunUtils.isPointInPolygon(p, shadowPoly)) return true;
         }
-        // else fall through to geometric
       }
 
-      // b) geometric fallback
-      final t = dXc * ux + dYc * uy; // along-sun distance (m)
-      if (t <= 0) continue;          // building behind the place relative to sun
+      final t = dXc * ux + dYc * uy;
+      if (t <= 0) continue;
 
-      final px = -uy; // unit perpendicular (rotate sun dir by -90°)
+      final px = -uy;
       final py =  ux;
       final lateral = (dXc * px + dYc * py).abs();
 
@@ -307,8 +315,9 @@ class SunUtils {
       final h = (b.bounds.northeast.coordinates.lat - b.bounds.southwest.coordinates.lat).abs()
           * metersPerDegreeLat;
       final halfDiag = 0.5 * math.sqrt(w * w + h * h);
-      final lateralAllowance = math.max(6.0, math.min(w, h) * 0.5);
 
+      // be a bit generous laterally
+      final lateralAllowance = math.max(6.0, math.min(w, h) * 0.5);
       if (lateral > (lateralAllowance + halfDiag * 0.15)) continue;
 
       final angBlock = math.atan((b.height.toDouble().clamp(0.5, 200.0)) / t);
@@ -326,5 +335,82 @@ class SunUtils {
       _ => "default",
     };
     return "${base}_${isInSun ? 'sun' : 'moon'}";
+  }
+
+
+  static Map<String, bool> smoothIconStatesByLocalConsensus({
+    required List<Place> places,
+    required Map<String, bool> initialSunState,
+    double radiusMeters = 10.0,
+    int minNeighbors = 1,
+    double requiredFraction = 0.66,
+  }) {
+    if (places.isEmpty) return initialSunState;
+
+    // simple uniform grid to keep this O(n)
+    // cell size ~= radius
+    final cellSizeM = radiusMeters;
+    final Map<String, List<int>> grid = {};
+    final lat0 = places.first.location.coordinates.lat.toDouble();
+
+    double toCellX(double lng, double lat) =>
+        (lng / SunUtils.metersToLng(cellSizeM, lat)).floorToDouble();
+    double toCellY(double lat) =>
+        (lat / SunUtils.metersToLat(cellSizeM)).floorToDouble();
+
+    for (int i = 0; i < places.length; i++) {
+      final p = places[i].location.coordinates;
+      final cx = toCellX(p.lng.toDouble(), lat0).toInt();
+      final cy = toCellY(p.lat.toDouble()).toInt();
+      final key = "$cx,$cy";
+      (grid[key] ??= []).add(i);
+    }
+
+    Map<String, bool> out = Map<String, bool>.from(initialSunState);
+
+    for (int i = 0; i < places.length; i++) {
+      final me = places[i];
+      final meType = me.type;
+      final p = me.location.coordinates;
+      final cx = toCellX(p.lng.toDouble(), lat0).toInt();
+      final cy = toCellY(p.lat.toDouble()).toInt();
+
+      int sunCount = 0, moonCount = 0, total = 0;
+
+      // inspect 3x3 neighbor cells
+      for (int dy = -1; dy <= 1; dy++) {
+        for (int dx = -1; dx <= 1; dx++) {
+          final key = "${cx+dx},${cy+dy}";
+          final idxs = grid[key];
+          if (idxs == null) continue;
+          for (final j in idxs) {
+            final other = places[j];
+            if (other.type != meType) continue; // only same type
+            final q = other.location.coordinates;
+            final d = SunUtils.haversineMeters(
+              p.lat.toDouble(), p.lng.toDouble(),
+              q.lat.toDouble(), q.lng.toDouble(),
+            );
+            if (d <= radiusMeters + 0.001) {
+              total++;
+              final isSun = initialSunState[other.id] ?? false;
+              if (isSun) sunCount++; else moonCount++;
+            }
+          }
+        }
+      }
+
+      if (total - 1 /*exclude self*/ >= minNeighbors) {
+        final sunFrac = total == 0 ? 0.0 : (sunCount / total);
+        final moonFrac = total == 0 ? 0.0 : (moonCount / total);
+        if (sunFrac >= requiredFraction) {
+          out[me.id] = true;
+        } else if (moonFrac >= requiredFraction) {
+          out[me.id] = false;
+        }
+      }
+    }
+
+    return out;
   }
 }
