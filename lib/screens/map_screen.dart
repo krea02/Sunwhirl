@@ -2,6 +2,7 @@
 import 'dart:async';
 import 'dart:math' as math;
 import 'dart:typed_data';
+import 'dart:ui' as ui;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -20,7 +21,6 @@ import '../providers/map_state.dart';
 import '../models/city.dart';
 import '../data/slovenia_cities.dart';
 
-// Terrain horizon (provided elsewhere with your private token/config)
 import '../services/terrain_elevation_service.dart';
 
 class MapScreen extends StatefulWidget {
@@ -57,13 +57,11 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
   // City filter
   City? _selectedCity;
 
-  // Terrain horizon (optional)
-  TerrainElevationService? _elevService;     // injected via Provider if present
+  TerrainElevationService? _elevService;
   final bool _useTerrainHorizon = true;
-  final double _horizonMarginDeg = 0.5;      // conservative bump
-  final Map<String, double> _horizonCache = {}; // key: qLat,qLng,sector10 -> horizon angle (rad)
+  final double _horizonMarginDeg = 0.5;
+  final Map<String, double> _horizonCache = {};
 
-  // ---- NEW: listen to MapState so we redraw when data lands ----
   Timer? _stateRedrawTimer;
   MapState? _mapStateRef;
   VoidCallback? _mapStateListener;
@@ -81,10 +79,8 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
   void didChangeDependencies() {
     super.didChangeDependencies();
 
-    // Try to obtain TerrainElevationService if the app provided it.
     _elevService ??= _tryGetTerrainService(context);
 
-    // Attach a listener to MapState so icons/shadows render as soon as data loads.
     final ms = Provider.of<MapState>(context, listen: false);
     if (_mapStateRef != ms) {
       if (_mapStateRef != null && _mapStateListener != null) {
@@ -102,7 +98,6 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
       _mapStateRef!.addListener(_mapStateListener!);
     }
 
-    // Keep your time-change redraw
     final mapState = context.watch<MapState>();
     final currentTime = mapState.selectedDateTime;
     if (_mapReady && !_isRedrawing && (_lastDrawTime == null || !_lastDrawTime!.isAtSameMomentAs(currentTime))) {
@@ -116,7 +111,7 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
     try {
       return Provider.of<TerrainElevationService>(context, listen: false);
     } catch (_) {
-      return null; // Provider not registered → terrain horizon disabled
+      return null;
     }
   }
 
@@ -273,7 +268,6 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
   void _goToCity(City city) async {
     final mapState = Provider.of<MapState>(context, listen: false);
 
-    // Clear caches so new area fetches immediately
     mapState.clearAllAccumulatedBuildingData();
     mapState.clearAllAccumulatedPlaceData();
 
@@ -282,7 +276,6 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
     final targetCenter = Point(coordinates: Position(city.lng, city.lat));
     final targetCam = CameraOptions(center: targetCenter, zoom: city.zoom, pitch: 15.0);
 
-    // Prefetch for destination bounds so data is ready when we arrive
     try {
       if (_mapboxMap != null) {
         final targetBounds = await _mapboxMap!.coordinateBoundsForCamera(targetCam);
@@ -291,10 +284,8 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
       }
     } catch (_) {}
 
-    // Fly the camera
     _moveCameraTo(targetCenter, zoom: city.zoom);
 
-    // After fly finishes, make sure we redraw (listener will also fire when data arrives)
     Future.delayed(const Duration(milliseconds: 1700), () async {
       if (!mounted) return;
       await _updateLastCameraState();
@@ -349,7 +340,6 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
     );
   }
 
-  // Terrain-horizon cache key: quantize lat/lng + 10° azimuth bucket
   String _hKey(double lat, double lng, double azRad) {
     final sector = ((azRad * SunUtils.deg) / 10.0).round() * 10; // 10°
     final qLat = (lat * 200).round() / 200.0; // ~0.005°
@@ -396,7 +386,6 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
     return chosen.toList()..sort();
   }
 
-  // ---------- Redraw ----------
   Future<void> _tryRedraw(String source) async {
     if (_isRedrawing) return;
     if (!mounted || _mapboxMap == null || !_mapReady || !_iconsLoaded ||
@@ -850,7 +839,7 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
                   child: Container(
                     padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
                     decoration: BoxDecoration(
-                      color: colors.surface.withOpacity(0.9),
+                      color: colors.surface.withOpacity(0.95),
                       borderRadius: BorderRadius.circular(20),
                       boxShadow: kElevationToShadow[2],
                     ),
@@ -870,7 +859,7 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
                             : mapState.isLoadingBuildings
                             ? "Loading buildings..."
                             : "Loading places...")
-                            : "Map Ready",
+                            : "Map ready",
                         style: TextStyle(color: colors.onSurface),
                       ),
                     ]),
@@ -880,14 +869,13 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
             ),
           ),
 
-          // Sun direction arrow
           Positioned(
             top: 20, right: 20,
             child: SafeArea(
               child: Container(
-                padding: const EdgeInsets.all(4),
+                padding: const EdgeInsets.all(6),
                 decoration: BoxDecoration(
-                  color: colors.surface.withOpacity(0.7),
+                  color: colors.surface.withOpacity(0.75),
                   shape: BoxShape.circle,
                   boxShadow: kElevationToShadow[1],
                 ),
@@ -925,7 +913,7 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
                 child: Container(
                   padding: const EdgeInsets.symmetric(horizontal: 15, vertical: 8),
                   decoration: BoxDecoration(
-                    color: colors.surface.withOpacity(0.9),
+                    color: colors.surface.withOpacity(0.95),
                     borderRadius: BorderRadius.circular(20),
                     boxShadow: kElevationToShadow[2],
                   ),
@@ -1020,18 +1008,13 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
     final candidates = <Uri>[];
 
     if (defaultTargetPlatform == TargetPlatform.android) {
-      // Prefer Google Maps app
       candidates.add(Uri.parse("google.navigation:q=$lat,$lng&mode=d"));
-      // geo URI with a label (will open Maps if available)
       candidates.add(Uri.parse("geo:0,0?q=$lat,$lng($label)"));
     } else if (defaultTargetPlatform == TargetPlatform.iOS) {
-      // Google Maps app on iOS
       candidates.add(Uri.parse("comgooglemaps://?daddr=$lat,$lng&directionsmode=driving"));
-      // Apple Maps fallback
       candidates.add(Uri.parse("maps://?daddr=$lat,$lng&dirflg=d"));
     }
 
-    // Universal HTTP fallback (browser if no app)
     candidates.add(Uri.parse("https://www.google.com/maps/dir/?api=1&destination=$lat,$lng&travelmode=driving"));
 
     for (final uri in candidates) {
@@ -1039,7 +1022,7 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
         final ok = await launchUrl(uri, mode: LaunchMode.externalApplication);
         if (ok) return;
       } catch (_) {
-        // keep trying next candidate
+        // try next
       }
     }
 
@@ -1095,4 +1078,31 @@ class _CityFilterChip extends StatelessWidget {
       ),
     );
   }
+}
+
+class _CompassPainter extends CustomPainter {
+  _CompassPainter(this.context);
+  final BuildContext context;
+
+  @override
+  void paint(ui.Canvas canvas, ui.Size size) {
+    final scheme = Theme.of(context).colorScheme;
+    final center = Offset(size.width / 2, size.height / 2);
+    final r = size.shortestSide / 2;
+
+    final ring = Paint()
+      ..color = scheme.outlineVariant
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1.2;
+
+    final dot = Paint()
+      ..color = scheme.primary
+      ..style = PaintingStyle.fill;
+
+    canvas.drawCircle(center, r - 1, ring);
+    canvas.drawCircle(center, 2.5, dot);
+  }
+
+  @override
+  bool shouldRepaint(covariant _CompassPainter oldDelegate) => false;
 }

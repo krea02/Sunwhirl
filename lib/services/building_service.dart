@@ -145,15 +145,12 @@ class BuildingService {
     return _defaultBuildingHeight;
   }
 
-  /// ⚠️ DEPRECATED: Fixed-radius fetch (~200m). Use [fetchBuildingsAround] instead.
   static Future<List<Building>> fetchBuildings(double lat, double lng) async {
     return await fetchBuildingsAround(lat, lng, 200);
   }
 
-  /// ✅ NEW: Fetch buildings around a lat/lng with custom radius in meters
   static Future<List<Building>> fetchBuildingsAround(
       double lat, double lng, double radiusInMeters) async {
-    // Approximate conversion from meters to degrees
     final double delta = radiusInMeters / 111320.0;
 
     final bounds = CoordinateBounds(

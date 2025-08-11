@@ -7,7 +7,7 @@ import 'package:image/image.dart' as img;
 class TerrainElevationService {
   TerrainElevationService({
     required this.mapboxToken,
-    this.zoom = 14,        // good detail without too many tiles
+    this.zoom = 14,
     this.useHiDpi = false, // if true uses @2x (512px) tiles
     this.maxTilesInCache = 128,
   });

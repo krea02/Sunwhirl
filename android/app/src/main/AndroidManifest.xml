@@ -12,7 +12,6 @@
         android:label="sunwhirlv1"
         android:icon="@mipmap/ic_launcher">
 
-        <!-- Mapbox access token pulled via manifest placeholder (set in build.gradle) -->
         <meta-data
             android:name="com.mapbox.token"
             android:value="${MAPBOX_ACCESS_TOKEN}" />
@@ -42,8 +41,19 @@
             android:value="2" />
     </application>
 
-    <!-- Optional: you had this, keeping as-is -->
     <queries>
+        <package android:name="com.google.android.apps.maps" />
+
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="geo" />
+        </intent>
+
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="google.navigation" />
+        </intent>
+
         <intent>
             <action android:name="android.intent.action.PROCESS_TEXT" />
             <data android:mimeType="text/plain" />

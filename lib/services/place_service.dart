@@ -65,7 +65,6 @@ out center tags;
     }
   }
 
-  /// Parse Overpass response to Place list with outdoor seating inference.
   static List<Place> _parseOverpassPlacesResponse(Map<String, dynamic> data) {
     final List<Place> places = [];
     final Set<String> seen = {};
@@ -89,7 +88,6 @@ out center tags;
         continue;
       }
 
-      // Coordinates: node has lat/lon; ways/relations use center
       double? lat, lon;
       if (el['type'] == 'node') {
         lat = (el['lat'] as num?)?.toDouble();
@@ -112,12 +110,10 @@ out center tags;
       int? outdoorSeats;
       bool? outdoorCovered;
 
-      // 1) explicit outdoor_seating
       final os = (tags['outdoor_seating'] ?? tags['outdoor seating'])?.toString().toLowerCase();
       if (os == 'yes' || os == 'only') hasOutdoor = true;
       else if (os == 'no') hasOutdoor = false;
 
-      // 2) seat counts
       final seatsStr = (tags['seats:outdoor'] ?? tags['seats:outside'])?.toString();
       if (seatsStr != null) {
         final parsed = int.tryParse(seatsStr.replaceAll(RegExp(r'[^0-9]'), ''));
@@ -127,7 +123,6 @@ out center tags;
         }
       }
 
-      // 3) proxies: biergarten / terrace
       if (amenity == 'biergarten') hasOutdoor = true;
       if (tags['terrace']?.toString().toLowerCase() == 'yes') {
         hasOutdoor ??= true;

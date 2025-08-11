@@ -347,8 +347,6 @@ class SunUtils {
   }) {
     if (places.isEmpty) return initialSunState;
 
-    // simple uniform grid to keep this O(n)
-    // cell size ~= radius
     final cellSizeM = radiusMeters;
     final Map<String, List<int>> grid = {};
     final lat0 = places.first.location.coordinates.lat.toDouble();
@@ -377,7 +375,6 @@ class SunUtils {
 
       int sunCount = 0, moonCount = 0, total = 0;
 
-      // inspect 3x3 neighbor cells
       for (int dy = -1; dy <= 1; dy++) {
         for (int dx = -1; dx <= 1; dx++) {
           final key = "${cx+dx},${cy+dy}";
@@ -385,7 +382,7 @@ class SunUtils {
           if (idxs == null) continue;
           for (final j in idxs) {
             final other = places[j];
-            if (other.type != meType) continue; // only same type
+            if (other.type != meType) continue;
             final q = other.location.coordinates;
             final d = SunUtils.haversineMeters(
               p.lat.toDouble(), p.lng.toDouble(),
