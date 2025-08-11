@@ -20,6 +20,7 @@ dependencies:
   # ---- Use correct version for dart_suncalc ----
   # ---- End Correction ----
   url_launcher: ^6.3.0        # Launching external URLs (navigation)
+  image: ^4.1.7
 
   # Location Services (Optional but common for map apps)
   geolocator: ^12.0.0         # Getting device location

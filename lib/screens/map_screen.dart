@@ -15,6 +15,10 @@ import '../models/building.dart';
 import '../utils/sun_utils.dart';
 import '../providers/map_state.dart';
 
+// NEW
+import '../models/city.dart';
+import '../data/slovenia_cities.dart';
+
 class MapScreen extends StatefulWidget {
   const MapScreen({super.key});
 
@@ -48,10 +52,13 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
   bool _isRedrawing = false;
 
   // Sticky icons: keep markers within padded viewport
-  static const double _markerPadMeters = 350.0; // try 300–500m for stickiness
+  static const double _markerPadMeters = 350.0; // try 300–500m
 
-  // Safety cap for total annotations (prevents memory spikes)
+  // Safety cap for total annotations
   static const int _kMaxAnnotations = 1200;
+
+  // NEW: current chosen city (nullable at start)
+  City? _selectedCity;
 
   @override
   bool get wantKeepAlive => true;
@@ -231,6 +238,29 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
     );
   }
 
+  // ------------------ City jump ------------------
+
+  void _goToCity(City city) {
+    final mapState = Provider.of<MapState>(context, listen: false);
+
+    // Clear cached coverage so new area fetches immediately
+    mapState.clearAllAccumulatedBuildingData();
+    mapState.clearAllAccumulatedPlaceData();
+
+    setState(() => _selectedCity = city);
+
+    final p = Point(coordinates: Position(city.lng, city.lat));
+    _moveCameraTo(p, zoom: city.zoom);
+
+    // Nudge fetch/redraw after the fly animation
+    Future.delayed(const Duration(milliseconds: 1700), () async {
+      if (!mounted) return;
+      await _updateLastCameraState();
+      _triggerDataFetch();
+      _tryRedraw("city change → ${city.name}");
+    });
+  }
+
   // ------------------ Helpers (bounds, scale, thinning) ------------------
 
   bool _checkAabbIntersection(CoordinateBounds b1, CoordinateBounds b2) {
@@ -284,7 +314,6 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
     );
   }
 
-  /// Returns indices (into `opts`) to keep, using a coarse grid for geographic spread.
   List<int> _thinByGrid(List<PointAnnotationOptions> opts, int targetCount) {
     if (opts.length <= targetCount) {
       return List<int>.generate(opts.length, (i) => i);
@@ -326,7 +355,7 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
     return chosen.toList()..sort();
   }
 
-  // ------------------ Redraw pipeline ------------------
+  // ------------------ Redraw pipeline (same as before) ------------------
 
   Future<void> _tryRedraw(String source) async {
     if (_isRedrawing) {
@@ -350,10 +379,7 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
 
       _lastDrawTime = dateTime;
 
-      // Shadows
       final shadowLogic = await _calculateAndDrawBuildingShadows(buildings, dateTime, bounds);
-
-      // Places (diff)
       await _drawPlaces(places, buildings, dateTime, shadowLogic, bounds);
     } catch (e, s) {
       if (kDebugMode && mounted) {
@@ -373,12 +399,8 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
       ) async {
     if (!mounted || _polygonManager == null || _lastCameraState == null) return {};
 
-    // Clear previous polygons so nothing accumulates
-    try {
-      await _polygonManager!.deleteAll();
-    } catch (_) {}
+    try { await _polygonManager!.deleteAll(); } catch (_) {}
 
-    // Sun at center (consistent direction/opacity)
     final sunPosCenter = SunUtils.getSunPosition(
       dateTime,
       _lastCameraState!.center.coordinates.lat.toDouble(),
@@ -390,7 +412,6 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
     final Map<String, List<Position>> calculatedShadowsForLogic = {};
     final List<PolygonAnnotationOptions> draw = [];
 
-    // If night — no drawing, but keep logic map
     if (sunAltitudeRad <= SunUtils.altitudeThresholdRad) {
       for (final b in allLoadedBuildings) {
         calculatedShadowsForLogic.putIfAbsent(b.id, () => []);
@@ -398,9 +419,8 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
       return calculatedShadowsForLogic;
     }
 
-    // base opacity curve (soft)
     final altDeg = sunAltitudeRad * SunUtils.deg;
-    const double maxShadowOpacity = 0.30; // tweak in 0.12–0.28 range
+    const double maxShadowOpacity = 0.22;
     const double horizonFadeEndAlt = SunUtils.altitudeThresholdRad * SunUtils.deg + 0.5;
     const double horizonFadeStartAlt = 5.0;
     const double peakOpacityStartAlt = 20.0;
@@ -412,16 +432,13 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
     if (altDeg <= horizonFadeEndAlt || altDeg >= zenithEndAlt) {
       baseOpacity = 0.0;
     } else if (altDeg < horizonFadeStartAlt) {
-      final f = (altDeg - horizonFadeEndAlt) / (horizonFadeStartAlt - horizonFadeEndAlt);
-      baseOpacity = f * maxShadowOpacity;
+      baseOpacity = ((altDeg - horizonFadeEndAlt) / (horizonFadeStartAlt - horizonFadeEndAlt)) * maxShadowOpacity;
     } else if (altDeg < peakOpacityStartAlt) {
-      final f = (altDeg - horizonFadeStartAlt) / (peakOpacityStartAlt - horizonFadeStartAlt);
-      baseOpacity = f * maxShadowOpacity;
+      baseOpacity = ((altDeg - horizonFadeStartAlt) / (peakOpacityStartAlt - horizonFadeStartAlt)) * maxShadowOpacity;
     } else if (altDeg <= zenithFadeStartAlt) {
       baseOpacity = maxShadowOpacity;
     } else {
-      final f = 1.0 - (altDeg - zenithFadeStartAlt) / (zenithEndAlt - zenithFadeStartAlt);
-      baseOpacity = f * maxShadowOpacity;
+      baseOpacity = (1.0 - (altDeg - zenithFadeStartAlt) / (zenithEndAlt - zenithFadeStartAlt)) * maxShadowOpacity;
     }
     baseOpacity = baseOpacity.clamp(0.0, maxShadowOpacity);
 
@@ -432,17 +449,14 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
       return calculatedShadowsForLogic;
     }
 
-    // zoom-based length threshold + softness
     final zoom = _lastCameraState!.zoom;
     final centerLat = _lastCameraState!.center.coordinates.lat.toDouble();
     final mpp = SunUtils.metersPerPixel(centerLat, zoom);
-    final double minShadowMeters = math.max(0.5, mpp * 1.2); // ~1.2px, never below 0.5 m
+    final double minShadowMeters = math.max(0.5, mpp * 1.2);
 
-    // soften shadows when zoomed out (reduces heavy darkening)
-    final zoomFactor = ((zoom - 12.0) / 5.0).clamp(0.0, 1.0); // 12→17
-    final zoomOpacityAdj = 0.65 + 0.35 * zoomFactor;          // 65% → 100%
+    final zoomFactor = ((zoom - 12.0) / 5.0).clamp(0.0, 1.0);
+    final zoomOpacityAdj = 0.65 + 0.35 * zoomFactor;
 
-    // overlap attenuation grid
     final sw = currentViewportBounds.southwest.coordinates;
     final ne = currentViewportBounds.northeast.coordinates;
     double _toCol(double lng) => ((lng - sw.lng) / (ne.lng - sw.lng + 1e-12)).clamp(0.0, 0.9999);
@@ -466,7 +480,6 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
       calculatedShadowsForLogic[b.id] = poly.isNotEmpty ? List<Position>.from(poly) : [];
       if (poly.length < 3) continue;
 
-      // centroid → attenuation bucket
       double cLat = 0, cLng = 0;
       for (final p in poly) { cLat += p.lat.toDouble(); cLng += p.lng.toDouble(); }
       cLat /= poly.length; cLng /= poly.length;
@@ -477,7 +490,6 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
       final overlapFactor = 1.0 / (1.0 + seen);
       final op = (baseOpacity * zoomOpacityAdj * overlapFactor).clamp(0.03, 0.16);
 
-      // optional hole (don’t darken the footprint itself)
       List<Position> hole = [];
       if (b.polygon.isNotEmpty) {
         final fp = List<Position>.from(b.polygon);
@@ -524,9 +536,7 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
     final double iconScale = _iconScaleForZoom(zoom);
     final String newBucket = _bucketForZoom(zoom);
 
-    // Sticky bounds: keep markers in a padded viewport so they “stick” when panning slowly
     final paddedBounds = _padBounds(currentViewportBounds, _markerPadMeters);
-
     final relevantBuildings =
     allLoadedBuildings.where((b) => _checkAabbIntersection(b.bounds, paddedBounds)).toList();
 
@@ -630,7 +640,7 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
       }
     }
 
-    // Remove those that went off the padded viewport
+    // remove those no longer in padded viewport
     final gone = _placeIdToAnnotation.keys.where((id) {
       final ann = _placeIdToAnnotation[id];
       if (ann == null) return true;
@@ -646,7 +656,6 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
       }
     }
 
-    // Apply deletes first
     if (toDelete.isNotEmpty) {
       for (final pid in toDeletePlaceIds) {
         final ann = _placeIdToAnnotation.remove(pid);
@@ -661,12 +670,11 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
       }
     }
 
-    // Enforce cap via grid thinning (for toCreate batch)
+    // enforce cap with grid thinning for the batch
     if (toCreate.isNotEmpty) {
       final existingCount = _placeIdToAnnotation.length;
       final budget = (_kMaxAnnotations - existingCount).clamp(0, _kMaxAnnotations);
       if (budget <= 0) {
-        // no room to add more
         toCreate.clear();
         placesForCreatedAnnotations.clear();
       } else if (toCreate.length > budget) {
@@ -686,7 +694,6 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
       }
     }
 
-    // Create / recreate
     if (toCreate.isNotEmpty) {
       try {
         final created = await _pointAnnotationManager!.createMulti(toCreate);
@@ -703,7 +710,6 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
       }
     }
 
-    // Update remembered state
     _placeSunState
       ..clear()
       ..addAll(newSunState);
@@ -758,7 +764,8 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
             onMapLoadedListener: _onMapLoaded,
             onMapIdleListener: _onCameraIdle,
           ),
-          // Loading Indicator
+
+          // Loading indicator
           Positioned(
             top: 10, left: 10,
             child: SafeArea(
@@ -799,7 +806,8 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
               ),
             ),
           ),
-          // Sun Direction Arrow
+
+          // Sun direction arrow
           Positioned(
             top: 20, right: 20,
             child: SafeArea(
@@ -824,7 +832,19 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
               ),
             ),
           ),
-          // Current Date/Time Display
+
+          // City filter chip (under the arrow)
+          Positioned(
+            top: 68, right: 16,
+            child: SafeArea(
+              child: _CityFilterChip(
+                selected: _selectedCity?.name ?? 'City',
+                onPick: (city) => _goToCity(city),
+              ),
+            ),
+          ),
+
+          // Current Date/Time
           Positioned(
             bottom: 15, left: 0, right: 0,
             child: IgnorePointer(
@@ -859,8 +879,6 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
     if (!mounted) return;
     final theme = Theme.of(context);
     final colors = theme.colorScheme;
-
-    // Optional: show sun az/alt for this place/time
     final mapState = Provider.of<MapState>(context, listen: false);
     final dt = mapState.selectedDateTime;
     final lat = place.location.coordinates.lat.toDouble();
@@ -958,12 +976,61 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
   }
 }
 
-/// Custom Click Listener for Mapbox Point Annotations.
 class AnnotationClickListener extends OnPointAnnotationClickListener {
   final Function(PointAnnotation) onAnnotationClick;
   AnnotationClickListener({required this.onAnnotationClick});
   @override
   void onPointAnnotationClick(PointAnnotation annotation) {
     onAnnotationClick(annotation);
+  }
+}
+
+// --------- UI piece for the city filter ---------
+
+class _CityFilterChip extends StatelessWidget {
+  final String selected;
+  final ValueChanged<City> onPick;
+
+  const _CityFilterChip({
+    required this.selected,
+    required this.onPick,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
+
+    return Container(
+      decoration: BoxDecoration(
+        color: colors.surface.withOpacity(0.9),
+        borderRadius: BorderRadius.circular(24),
+        boxShadow: kElevationToShadow[2],
+      ),
+      child: PopupMenuButton<City>(
+        tooltip: 'Pick a city',
+        onSelected: onPick,
+        itemBuilder: (ctx) {
+          return slovenianCities
+              .map((c) => PopupMenuItem<City>(
+            value: c,
+            child: Text(c.name),
+          ))
+              .toList();
+        },
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(Icons.location_city_rounded, size: 18),
+              const SizedBox(width: 8),
+              Text(selected, style: TextStyle(color: colors.onSurface)),
+              const SizedBox(width: 4),
+              const Icon(Icons.arrow_drop_down),
+            ],
+          ),
+        ),
+      ),
+    );
   }
 }
