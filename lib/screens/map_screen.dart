@@ -1,8 +1,7 @@
-// screens/map_screen.dart
+// lib/screens/map_screen.dart
 import 'dart:async';
 import 'dart:math' as math;
 import 'dart:typed_data';
-import 'dart:ui' as ui;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -20,8 +19,80 @@ import '../providers/map_state.dart';
 // Cities
 import '../models/city.dart';
 import '../data/slovenia_cities.dart';
+import '../data/croatia_cities.dart';
+import '../data/serbia_cities.dart';
 
+// Terrain horizon (optional)
 import '../services/terrain_elevation_service.dart';
+
+enum Country { si, hr, rs }
+enum AppLang { en, sl, hr, sr }
+
+extension AppLangX on AppLang {
+  String get code => switch (this) { AppLang.en => 'en', AppLang.sl => 'sl', AppLang.hr => 'hr', AppLang.sr => 'sr' };
+}
+
+/// Tiny localizer for the few strings used on this screen
+class Strs {
+  final AppLang lang;
+  Strs(this.lang);
+
+  String get mapReady => switch (lang) {
+    AppLang.sl => 'Zemljevid pripravljen',
+    AppLang.hr => 'Karta spremna',
+    AppLang.sr => 'Mapa spremna',
+    _ => 'Map ready',
+  };
+
+  String get loadingMapData => switch (lang) {
+    AppLang.sl => 'Nalaganje podatkov zemljevida...',
+    AppLang.hr => 'Učitavanje podataka karte...',
+    AppLang.sr => 'Učitavanje podataka mape...',
+    _ => 'Loading map data...',
+  };
+
+  String get loadingBuildings => switch (lang) {
+    AppLang.sl => 'Nalaganje stavb...',
+    AppLang.hr => 'Učitavanje zgrada...',
+    AppLang.sr => 'Učitavanje zgrada...',
+    _ => 'Loading buildings...',
+  };
+
+  String get loadingPlaces => switch (lang) {
+    AppLang.sl => 'Nalaganje mest...',
+    AppLang.hr => 'Učitavanje mjesta...',
+    AppLang.sr => 'Učitavanje mesta...',
+    _ => 'Loading places...',
+  };
+
+  String get pickCity => switch (lang) {
+    AppLang.sl => 'Izberi mesto',
+    AppLang.hr => 'Odaberi grad',
+    AppLang.sr => 'Izaberi grad',
+    _ => 'Pick a city',
+  };
+
+  String get cityLabel => switch (lang) {
+    AppLang.sl => 'Mesto',
+    AppLang.hr => 'Grad',
+    AppLang.sr => 'Grad',
+    _ => 'City',
+  };
+
+  String get close => switch (lang) {
+    AppLang.sl => 'Zapri',
+    AppLang.hr => 'Zatvori',
+    AppLang.sr => 'Zatvori',
+    _ => 'Close',
+  };
+
+  String get navigate => switch (lang) {
+    AppLang.sl => 'Navigiraj',
+    AppLang.hr => 'Navigiraj',
+    AppLang.sr => 'Navigacija',
+    _ => 'Navigate',
+  };
+}
 
 class MapScreen extends StatefulWidget {
   const MapScreen({super.key});
@@ -54,20 +125,41 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
   static const double _markerPadMeters = 350.0;
   static const int _kMaxAnnotations = 1200;
 
-  // City filter
+  // Country / language / city
+  Country _country = Country.si;
+  AppLang _lang = AppLang.sl;
   City? _selectedCity;
 
+  // Terrain horizon (optional)
   TerrainElevationService? _elevService;
   final bool _useTerrainHorizon = true;
   final double _horizonMarginDeg = 0.5;
   final Map<String, double> _horizonCache = {};
 
+  // Redraw when MapState updates its data
   Timer? _stateRedrawTimer;
   MapState? _mapStateRef;
   VoidCallback? _mapStateListener;
 
   @override
   bool get wantKeepAlive => true;
+
+  List<City> get _citiesForCountry => switch (_country) {
+    Country.si => slovenianCities,
+    Country.hr => croatianCities,
+    Country.rs => serbianCities,
+  };
+
+  void _setCountry(Country c, {bool alsoSetLanguage = true}) {
+    setState(() {
+      _country = c;
+      if (alsoSetLanguage) {
+        _lang = switch (c) { Country.si => AppLang.sl, Country.hr => AppLang.hr, Country.rs => AppLang.sr };
+      }
+    });
+  }
+
+  void _setLanguage(AppLang l) => setState(() => _lang = l);
 
   @override
   void initState() {
@@ -81,6 +173,7 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
 
     _elevService ??= _tryGetTerrainService(context);
 
+    // Attach a listener to MapState so icons/shadows render as soon as data loads.
     final ms = Provider.of<MapState>(context, listen: false);
     if (_mapStateRef != ms) {
       if (_mapStateRef != null && _mapStateListener != null) {
@@ -98,6 +191,7 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
       _mapStateRef!.addListener(_mapStateListener!);
     }
 
+    // Keep time-change redraw
     final mapState = context.watch<MapState>();
     final currentTime = mapState.selectedDateTime;
     if (_mapReady && !_isRedrawing && (_lastDrawTime == null || !_lastDrawTime!.isAtSameMomentAs(currentTime))) {
@@ -137,10 +231,14 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
 
   Future<void> _loadIconImages() async {
     final iconPaths = {
-      "cafe_sun": "assets/icons/cafe_sun.png", "cafe_moon": "assets/icons/cafe_moon.png",
-      "pub_sun": "assets/icons/pub_sun.png", "pub_moon": "assets/icons/pub_moon.png",
-      "park_sun": "assets/icons/park_sun.png", "park_moon": "assets/icons/park_moon.png",
-      "default_sun": "assets/icons/default_sun.png", "default_moon": "assets/icons/default_moon.png",
+      "cafe_sun": "assets/icons/cafe_sun.png",
+      "cafe_moon": "assets/icons/cafe_moon.png",
+      "pub_sun": "assets/icons/pub_sun.png",
+      "pub_moon": "assets/icons/pub_moon.png",
+      "park_sun": "assets/icons/park_sun.png",
+      "park_moon": "assets/icons/park_moon.png",
+      "default_sun": "assets/icons/default_sun.png",
+      "default_moon": "assets/icons/default_moon.png",
     };
     final futures = iconPaths.entries.map((entry) async {
       try {
@@ -165,8 +263,8 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
     _mapboxMap = mapboxMap;
 
     final mapState = Provider.of<MapState>(context, listen: false);
-    final initialCenter = mapState.selectedPlace?.location
-        ?? Point(coordinates: Position(14.3310, 46.3895)); // Tržič approx.
+    final initialCenter = mapState.selectedPlace?.location ??
+        Point(coordinates: Position(14.3310, 46.3895)); // Tržič approx.
     const initialZoom = 14.0;
 
     try {
@@ -218,9 +316,8 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
         const dataZoomTol = 0.05;
         const arrowPosTol = 0.0001;
 
-        final movedData =
-            (start.center.coordinates.lat - _lastCameraState!.center.coordinates.lat).abs() > dataPosTol ||
-                (start.center.coordinates.lng - _lastCameraState!.center.coordinates.lng).abs() > dataPosTol;
+        final movedData = (start.center.coordinates.lat - _lastCameraState!.center.coordinates.lat).abs() > dataPosTol ||
+            (start.center.coordinates.lng - _lastCameraState!.center.coordinates.lng).abs() > dataPosTol;
         final zoomData = (start.zoom - _lastCameraState!.zoom).abs() > dataZoomTol;
         if (!movedData && !zoomData) fetch = false;
 
@@ -268,6 +365,7 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
   void _goToCity(City city) async {
     final mapState = Provider.of<MapState>(context, listen: false);
 
+    // Clear caches so new area fetches immediately
     mapState.clearAllAccumulatedBuildingData();
     mapState.clearAllAccumulatedPlaceData();
 
@@ -276,6 +374,7 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
     final targetCenter = Point(coordinates: Position(city.lng, city.lat));
     final targetCam = CameraOptions(center: targetCenter, zoom: city.zoom, pitch: 15.0);
 
+    // Prefetch for destination bounds so data is ready when we arrive
     try {
       if (_mapboxMap != null) {
         final targetBounds = await _mapboxMap!.coordinateBoundsForCamera(targetCam);
@@ -284,8 +383,10 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
       }
     } catch (_) {}
 
+    // Fly the camera
     _moveCameraTo(targetCenter, zoom: city.zoom);
 
+    // After fly finishes, make sure we redraw (listener will also fire when data arrives)
     Future.delayed(const Duration(milliseconds: 1700), () async {
       if (!mounted) return;
       await _updateLastCameraState();
@@ -318,6 +419,7 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
     if (z < 17.0) return 0.85;
     return 1.0;
   }
+
   String _bucketForZoom(double z) {
     if (z < 14.0) return "S";
     if (z < 15.5) return "M";
@@ -340,6 +442,7 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
     );
   }
 
+  // Terrain-horizon cache key: quantize lat/lng + 10° azimuth bucket
   String _hKey(double lat, double lng, double azRad) {
     final sector = ((azRad * SunUtils.deg) / 10.0).round() * 10; // 10°
     final qLat = (lat * 200).round() / 200.0; // ~0.005°
@@ -386,10 +489,10 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
     return chosen.toList()..sort();
   }
 
+  // ---------- Redraw ----------
   Future<void> _tryRedraw(String source) async {
     if (_isRedrawing) return;
-    if (!mounted || _mapboxMap == null || !_mapReady || !_iconsLoaded ||
-        _polygonManager == null || _pointAnnotationManager == null || _lastCameraState == null) {
+    if (!mounted || _mapboxMap == null || !_mapReady || !_iconsLoaded || _polygonManager == null || _pointAnnotationManager == null || _lastCameraState == null) {
       return;
     }
 
@@ -420,7 +523,9 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
       ) async {
     if (!mounted || _polygonManager == null || _lastCameraState == null) return {};
 
-    try { await _polygonManager!.deleteAll(); } catch (_) {}
+    try {
+      await _polygonManager!.deleteAll();
+    } catch (_) {}
 
     final sunPos = SunUtils.getSunPosition(
       dateTime,
@@ -428,7 +533,7 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
       _lastCameraState!.center.coordinates.lng.toDouble(),
     );
     final alt = sunPos['altitude']!;
-    final az  = sunPos['azimuth']!;
+    final az = sunPos['azimuth']!;
 
     final calculated = <String, List<Position>>{};
     final draw = <PolygonAnnotationOptions>[];
@@ -501,8 +606,12 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
 
       // overlap attenuation
       double cLat = 0, cLng = 0;
-      for (final p in poly) { cLat += p.lat.toDouble(); cLng += p.lng.toDouble(); }
-      cLat /= poly.length; cLng /= poly.length;
+      for (final p in poly) {
+        cLat += p.lat.toDouble();
+        cLng += p.lng.toDouble();
+      }
+      cLat /= poly.length;
+      cLng /= poly.length;
       final col = (_toCol(cLng) * gridN).floor().clamp(0, gridN - 1);
       final row = (_toRow(cLat) * gridN).floor().clamp(0, gridN - 1);
       final seen = density[row][col];
@@ -531,7 +640,9 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
     }
 
     if (draw.isNotEmpty) {
-      try { await _polygonManager!.createMulti(draw); } catch (_) {}
+      try {
+        await _polygonManager!.createMulti(draw);
+      } catch (_) {}
     }
 
     return calculated;
@@ -552,9 +663,7 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
 
     final paddedBounds = _padBounds(currentViewportBounds, _markerPadMeters);
 
-    final relevantBuildings = allLoadedBuildings
-        .where((b) => _checkAabbIntersection(b.bounds, paddedBounds))
-        .toList();
+    final relevantBuildings = allLoadedBuildings.where((b) => _checkAabbIntersection(b.bounds, paddedBounds)).toList();
 
     final visiblePlaceIds = <String>{};
     final visiblePlaces = <Place>[];
@@ -574,7 +683,7 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
 
       final sun = SunUtils.getSunPosition(dateTime, lat, lng);
       final altRad = sun['altitude']!;
-      final azRad  = sun['azimuth']!;
+      final azRad = sun['azimuth']!;
 
       bool isEffectiveSun = false;
 
@@ -586,7 +695,9 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
           if (hor == null && horizonBudget > 0) {
             try {
               hor = await SunUtils.horizonAngleRad(
-                lat, lng, azRad,
+                lat,
+                lng,
+                azRad,
                 sampleElevationM: _elevService!.sampleElevationM,
               );
               _horizonCache[key] = hor;
@@ -626,10 +737,10 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
             final dLat = SunUtils.metersToLat(d);
             final dLng = SunUtils.metersToLng(d, lat);
             final probes = <Position>[
-              Position(lng,        lat + dLat),
-              Position(lng + dLng, lat        ),
-              Position(lng,        lat - dLat),
-              Position(lng - dLng, lat        ),
+              Position(lng, lat + dLat),
+              Position(lng + dLng, lat),
+              Position(lng, lat - dLat),
+              Position(lng - dLng, lat),
             ];
             for (final p in probes) {
               final neighborBlocked = SunUtils.isPlaceInShadow(
@@ -814,6 +925,7 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
 
     final theme = Theme.of(context);
     final colors = theme.colorScheme;
+    final strs = Strs(_lang);
 
     return Scaffold(
       body: Stack(
@@ -829,7 +941,8 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
 
           // Loading indicator
           Positioned(
-            top: 10, left: 10,
+            top: 10,
+            left: 10,
             child: SafeArea(
               child: AnimatedOpacity(
                 opacity: isLoadingData ? 1.0 : 0.0,
@@ -845,7 +958,8 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
                     ),
                     child: Row(mainAxisSize: MainAxisSize.min, children: [
                       SizedBox(
-                        width: 16, height: 16,
+                        width: 16,
+                        height: 16,
                         child: CircularProgressIndicator(
                           strokeWidth: 2,
                           valueColor: AlwaysStoppedAnimation<Color>(colors.primary),
@@ -855,11 +969,11 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
                       Text(
                         isLoadingData
                             ? (mapState.isLoadingBuildings && mapState.isLoadingPlaces
-                            ? "Loading map data..."
+                            ? strs.loadingMapData
                             : mapState.isLoadingBuildings
-                            ? "Loading buildings..."
-                            : "Loading places...")
-                            : "Map ready",
+                            ? strs.loadingBuildings
+                            : strs.loadingPlaces)
+                            : strs.mapReady,
                         style: TextStyle(color: colors.onSurface),
                       ),
                     ]),
@@ -869,8 +983,10 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
             ),
           ),
 
+          // Sun direction arrow (top-right)
           Positioned(
-            top: 20, right: 20,
+            top: 20,
+            right: 20,
             child: SafeArea(
               child: Container(
                 padding: const EdgeInsets.all(6),
@@ -886,7 +1002,7 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
                     size: 32,
                     color: Colors.orange.withOpacity(sunArrowOpacity),
                     shadows: sunArrowOpacity > 0.5
-                        ? const [Shadow(color: Colors.black38, blurRadius: 3.0, offset: Offset(1,1))]
+                        ? const [Shadow(color: Colors.black38, blurRadius: 3.0, offset: Offset(1, 1))]
                         : null,
                   ),
                 ),
@@ -894,20 +1010,37 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
             ),
           ),
 
-          // City filter chip
+          // Country & language bar + City filter
           Positioned(
-            top: 68, right: 16,
+            top: 68,
+            right: 16,
             child: SafeArea(
-              child: _CityFilterChip(
-                selected: _selectedCity?.name ?? 'City',
-                onPick: (city) => _goToCity(city),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.end,
+                children: [
+                  _CountryLangBar(
+                    country: _country,
+                    lang: _lang,
+                    onCountryTap: (c) => _setCountry(c),
+                    onEnglishTap: () => _setLanguage(AppLang.en),
+                  ),
+                  const SizedBox(height: 8),
+                  _CityFilterChip(
+                    selected: _selectedCity?.name ?? strs.cityLabel,
+                    cities: _citiesForCountry,
+                    label: strs.pickCity,
+                    onPick: (city) => _goToCity(city),
+                  ),
+                ],
               ),
             ),
           ),
 
           // Current Date/Time
           Positioned(
-            bottom: 15, left: 0, right: 0,
+            bottom: 15,
+            left: 0,
+            right: 0,
             child: IgnorePointer(
               child: Center(
                 child: Container(
@@ -918,9 +1051,7 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
                     boxShadow: kElevationToShadow[2],
                   ),
                   child: Text(
-                    DateFormat.yMMMMEEEEd(Localizations.localeOf(context).toString())
-                        .add_Hm()
-                        .format(selectedDateTime),
+                    DateFormat.yMMMMEEEEd(_lang.code).add_Hm().format(selectedDateTime),
                     style: theme.textTheme.bodyMedium?.copyWith(
                       fontWeight: FontWeight.w500,
                       color: colors.onSurface,
@@ -946,7 +1077,7 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
     final lng = place.location.coordinates.lng.toDouble();
     final sun = SunUtils.getSunPosition(dt, lat, lng);
     final altDeg = (sun['altitude']! * SunUtils.deg).toStringAsFixed(1);
-    final azDeg  = (sun['azimuth']! * SunUtils.deg).toStringAsFixed(0);
+    final azDeg = (sun['azimuth']! * SunUtils.deg).toStringAsFixed(0);
 
     double? horizonDeg;
     if (_useTerrainHorizon && _elevService != null) {
@@ -954,6 +1085,8 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
       final hor = _horizonCache[key];
       if (hor != null) horizonDeg = hor * SunUtils.deg;
     }
+
+    final strs = Strs(_lang);
 
     showDialog(
       context: context,
@@ -965,7 +1098,8 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
         contentPadding: const EdgeInsets.fromLTRB(24.0, 20.0, 24.0, 10.0),
         content: SingleChildScrollView(
           child: Column(
-            mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Text("Type: ${place.type.name.toUpperCase()}",
                   style: theme.textTheme.labelLarge?.copyWith(color: colors.onSurfaceVariant)),
@@ -985,14 +1119,14 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(dialogContext),
-            child: Text("Close", style: TextStyle(color: colors.secondary)),
+            child: Text(strs.close, style: TextStyle(color: colors.secondary)),
           ),
           TextButton(
             onPressed: () {
               Navigator.pop(dialogContext);
               _launchNavigation(place);
             },
-            child: Text("Navigate", style: TextStyle(color: colors.primary, fontWeight: FontWeight.bold)),
+            child: Text(strs.navigate, style: TextStyle(color: colors.primary, fontWeight: FontWeight.bold)),
           ),
         ],
       ),
@@ -1008,13 +1142,18 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
     final candidates = <Uri>[];
 
     if (defaultTargetPlatform == TargetPlatform.android) {
+      // Prefer Google Maps app
       candidates.add(Uri.parse("google.navigation:q=$lat,$lng&mode=d"));
+      // geo URI with a label (will open Maps if available)
       candidates.add(Uri.parse("geo:0,0?q=$lat,$lng($label)"));
     } else if (defaultTargetPlatform == TargetPlatform.iOS) {
+      // Google Maps app on iOS
       candidates.add(Uri.parse("comgooglemaps://?daddr=$lat,$lng&directionsmode=driving"));
+      // Apple Maps fallback
       candidates.add(Uri.parse("maps://?daddr=$lat,$lng&dirflg=d"));
     }
 
+    // Universal HTTP fallback (browser if no app)
     candidates.add(Uri.parse("https://www.google.com/maps/dir/?api=1&destination=$lat,$lng&travelmode=driving"));
 
     for (final uri in candidates) {
@@ -1022,7 +1161,7 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
         final ok = await launchUrl(uri, mode: LaunchMode.externalApplication);
         if (ok) return;
       } catch (_) {
-        // try next
+        // keep trying next candidate
       }
     }
 
@@ -1043,12 +1182,140 @@ class AnnotationClickListener extends OnPointAnnotationClickListener {
   void onPointAnnotationClick(PointAnnotation annotation) => onAnnotationClick(annotation);
 }
 
-// --------- City filter UI ---------
+class _CountryLangBar extends StatelessWidget {
+  final Country country;
+  final AppLang lang;
+  final ValueChanged<Country> onCountryTap;
+  final VoidCallback onEnglishTap;
+
+  const _CountryLangBar({
+    required this.country,
+    required this.lang,
+    required this.onCountryTap,
+    required this.onEnglishTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
+
+    Widget _flagBtn({
+      required String asset,
+      required bool selected,
+      required VoidCallback onTap,
+      String? tooltip,
+    }) {
+      return Tooltip(
+        message: tooltip ?? '',
+        child: InkWell(
+          onTap: onTap,
+          borderRadius: BorderRadius.circular(20),
+          child: Container(
+            width: 34,
+            height: 34,
+            margin: const EdgeInsets.symmetric(horizontal: 4),
+            decoration: BoxDecoration(
+              color: selected ? colors.primary.withOpacity(0.12) : colors.surface.withOpacity(0.9),
+              borderRadius: BorderRadius.circular(20),
+              border: Border.all(
+                color: selected ? colors.primary : colors.outlineVariant,
+                width: selected ? 1.2 : 0.8,
+              ),
+              boxShadow: kElevationToShadow[1],
+            ),
+            padding: const EdgeInsets.all(4),
+            child: Image.asset(
+              asset,
+              fit: BoxFit.contain,
+              errorBuilder: (_, __, ___) => Icon(
+                Icons.flag_outlined,
+                size: 20,
+                color: selected ? colors.primary : colors.onSurfaceVariant,
+              ),
+            ),
+          ),
+        ),
+      );
+    }
+
+    Widget _chipEN() {
+      final selected = lang == AppLang.en;
+      return InkWell(
+        onTap: onEnglishTap,
+        borderRadius: BorderRadius.circular(20),
+        child: Container(
+          height: 34,
+          padding: const EdgeInsets.symmetric(horizontal: 10),
+          margin: const EdgeInsets.symmetric(horizontal: 4),
+          decoration: BoxDecoration(
+            color: selected ? colors.primary.withOpacity(0.12) : colors.surface.withOpacity(0.9),
+            borderRadius: BorderRadius.circular(20),
+            border: Border.all(
+              color: selected ? colors.primary : colors.outlineVariant,
+              width: selected ? 1.2 : 0.8,
+            ),
+            boxShadow: kElevationToShadow[1],
+          ),
+          alignment: Alignment.center,
+          child: Text(
+            'EN',
+            style: TextStyle(
+              fontWeight: FontWeight.w600,
+              color: selected ? colors.primary : colors.onSurface,
+            ),
+          ),
+        ),
+      );
+    }
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+      decoration: BoxDecoration(
+        color: colors.surface.withOpacity(0.9),
+        borderRadius: BorderRadius.circular(24),
+        boxShadow: kElevationToShadow[2],
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          _flagBtn(
+            asset: 'assets/icons/flag_si.png',
+            selected: country == Country.si,
+            onTap: () => onCountryTap(Country.si),
+            tooltip: 'Slovenia',
+          ),
+          _flagBtn(
+            asset: 'assets/icons/flag_hr.png',
+            selected: country == Country.hr,
+            onTap: () => onCountryTap(Country.hr),
+            tooltip: 'Croatia',
+          ),
+          _flagBtn(
+            asset: 'assets/icons/flag_rs.png',
+            selected: country == Country.rs,
+            onTap: () => onCountryTap(Country.rs),
+            tooltip: 'Serbia',
+          ),
+          const SizedBox(width: 4),
+          _chipEN(),
+        ],
+      ),
+    );
+  }
+}
+
 class _CityFilterChip extends StatelessWidget {
   final String selected;
+  final List<City> cities;
+  final String label;
   final ValueChanged<City> onPick;
 
-  const _CityFilterChip({required this.selected, required this.onPick});
+  const _CityFilterChip({
+    required this.selected,
+    required this.cities,
+    required this.label,
+    required this.onPick,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -1061,10 +1328,9 @@ class _CityFilterChip extends StatelessWidget {
         boxShadow: kElevationToShadow[2],
       ),
       child: PopupMenuButton<City>(
-        tooltip: 'Pick a city',
+        tooltip: label,
         onSelected: onPick,
-        itemBuilder: (ctx) => slovenianCities
-            .map((c) => PopupMenuItem<City>(value: c, child: Text(c.name))).toList(),
+        itemBuilder: (ctx) => cities.map((c) => PopupMenuItem<City>(value: c, child: Text(c.name))).toList(),
         child: Padding(
           padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
           child: Row(mainAxisSize: MainAxisSize.min, children: [
@@ -1078,31 +1344,4 @@ class _CityFilterChip extends StatelessWidget {
       ),
     );
   }
-}
-
-class _CompassPainter extends CustomPainter {
-  _CompassPainter(this.context);
-  final BuildContext context;
-
-  @override
-  void paint(ui.Canvas canvas, ui.Size size) {
-    final scheme = Theme.of(context).colorScheme;
-    final center = Offset(size.width / 2, size.height / 2);
-    final r = size.shortestSide / 2;
-
-    final ring = Paint()
-      ..color = scheme.outlineVariant
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 1.2;
-
-    final dot = Paint()
-      ..color = scheme.primary
-      ..style = PaintingStyle.fill;
-
-    canvas.drawCircle(center, r - 1, ring);
-    canvas.drawCircle(center, 2.5, dot);
-  }
-
-  @override
-  bool shouldRepaint(covariant _CompassPainter oldDelegate) => false;
 }
