@@ -6,4 +6,6 @@ const List<City> serbianCities = [
   City(name: 'Niš',          lat: 43.3209, lng: 21.8958, zoom: 14.8),
   City(name: 'Kragujevac',   lat: 44.0128, lng: 20.9110, zoom: 14.8),
   City(name: 'Subotica',     lat: 46.0990, lng: 19.6640, zoom: 14.8),
+  City(name: 'Zrenjanin',     lat: 45.37809, lng: 20.39393, zoom: 14.8),
+
 ];

@@ -92,6 +92,27 @@ class Strs {
     AppLang.sr => 'Navigacija',
     _ => 'Navigate',
   };
+
+  String get cafes => switch (lang) {
+    AppLang.sl => 'Kavarne',
+    AppLang.hr => 'Kafići',
+    AppLang.sr => 'Kafići',
+    _ => 'Cafés',
+  };
+
+  String get pubs => switch (lang) {
+    AppLang.sl => 'Pivnice',
+    AppLang.hr => 'Pivnice',
+    AppLang.sr => 'Pivnice',
+    _ => 'Pubs',
+  };
+
+  String get parks => switch (lang) {
+    AppLang.sl => 'Parki',
+    AppLang.hr => 'Parkovi',
+    AppLang.sr => 'Parkovi',
+    _ => 'Parks',
+  };
 }
 
 class MapScreen extends StatefulWidget {
@@ -121,9 +142,9 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
   DateTime? _lastDrawTime;
   bool _isRedrawing = false;
 
-  // Sticky icons & budget
-  static const double _markerPadMeters = 350.0;
-  static const int _kMaxAnnotations = 1200;
+  // Sticky icons & budget (perf tuned)
+  static const double _markerPadMeters = 320.0;
+  static const int _kMaxAnnotations = 1000;
 
   // Country / language / city
   Country _country = Country.si;
@@ -140,6 +161,16 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
   Timer? _stateRedrawTimer;
   MapState? _mapStateRef;
   VoidCallback? _mapStateListener;
+
+  // Filters (parks off by default)
+  final Set<PlaceType> _enabledTypes = {PlaceType.cafe, PlaceType.pub};
+  bool _filterOpen = false;
+
+  // Shadow reuse cache
+  double? _prevAltRad, _prevAzRad;
+  CoordinateBounds? _prevShadowBounds;
+  List<Building>? _prevShadowBuildingsRef;
+  Map<String, List<Position>> _cachedShadows = {};
 
   @override
   bool get wantKeepAlive => true;
@@ -161,6 +192,23 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
 
   void _setLanguage(AppLang l) => setState(() => _lang = l);
 
+  // Normalize angle to [-π, π]
+  double _wrapAngle(double x) {
+    const twoPi = 2 * math.pi;
+    x = (x + math.pi) % twoPi;
+    if (x < 0) x += twoPi;
+    return x - math.pi;
+  }
+
+  bool _boundsClose(CoordinateBounds a, CoordinateBounds b, {double tol = 0.0008}) {
+    final aSW = a.southwest.coordinates, aNE = a.northeast.coordinates;
+    final bSW = b.southwest.coordinates, bNE = b.northeast.coordinates;
+    return ((aSW.lat - bSW.lat).abs() < tol &&
+        (aSW.lng - bSW.lng).abs() < tol &&
+        (aNE.lat - bNE.lat).abs() < tol &&
+        (aNE.lng - bNE.lng).abs() < tol);
+  }
+
   @override
   void initState() {
     super.initState();
@@ -173,7 +221,7 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
 
     _elevService ??= _tryGetTerrainService(context);
 
-    // Attach a listener to MapState so icons/shadows render as soon as data loads.
+    // Listen for MapState changes and redraw lightly
     final ms = Provider.of<MapState>(context, listen: false);
     if (_mapStateRef != ms) {
       if (_mapStateRef != null && _mapStateListener != null) {
@@ -191,7 +239,7 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
       _mapStateRef!.addListener(_mapStateListener!);
     }
 
-    // Keep time-change redraw
+    // Time-change redraw
     final mapState = context.watch<MapState>();
     final currentTime = mapState.selectedDateTime;
     if (_mapReady && !_isRedrawing && (_lastDrawTime == null || !_lastDrawTime!.isAtSameMomentAs(currentTime))) {
@@ -226,6 +274,8 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
     _placeIdToAnnotation.clear();
     _placeSunState.clear();
     _horizonCache.clear();
+
+    _cachedShadows.clear();
     super.dispose();
   }
 
@@ -263,8 +313,8 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
     _mapboxMap = mapboxMap;
 
     final mapState = Provider.of<MapState>(context, listen: false);
-    final initialCenter = mapState.selectedPlace?.location ??
-        Point(coordinates: Position(14.3310, 46.3895)); // Tržič approx.
+    final initialCenter =
+        mapState.selectedPlace?.location ?? Point(coordinates: Position(14.3310, 46.3895)); // Tržič approx.
     const initialZoom = 14.0;
 
     try {
@@ -291,6 +341,10 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
     _placeSunState.clear();
     _annotationIdToPlace.clear();
     _iconScaleBucket = "";
+    _cachedShadows.clear();
+    _prevAltRad = _prevAzRad = null;
+    _prevShadowBounds = null;
+    _prevShadowBuildingsRef = null;
 
     _updateLastCameraState().then((_) {
       if (!mounted || _lastCameraState == null) return;
@@ -303,7 +357,7 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
   void _onCameraIdle(MapIdleEventData event) {
     if (!mounted || !_mapReady) return;
     _mapIdleTimer?.cancel();
-    _mapIdleTimer = Timer(const Duration(milliseconds: 700), () async {
+    _mapIdleTimer = Timer(const Duration(milliseconds: 500), () async {
       if (!mounted || !_mapReady || _isRedrawing) return;
 
       final start = _previousIdleCameraState;
@@ -316,8 +370,9 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
         const dataZoomTol = 0.05;
         const arrowPosTol = 0.0001;
 
-        final movedData = (start.center.coordinates.lat - _lastCameraState!.center.coordinates.lat).abs() > dataPosTol ||
-            (start.center.coordinates.lng - _lastCameraState!.center.coordinates.lng).abs() > dataPosTol;
+        final movedData =
+            (start.center.coordinates.lat - _lastCameraState!.center.coordinates.lat).abs() > dataPosTol ||
+                (start.center.coordinates.lng - _lastCameraState!.center.coordinates.lng).abs() > dataPosTol;
         final zoomData = (start.zoom - _lastCameraState!.zoom).abs() > dataZoomTol;
         if (!movedData && !zoomData) fetch = false;
 
@@ -365,7 +420,6 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
   void _goToCity(City city) async {
     final mapState = Provider.of<MapState>(context, listen: false);
 
-    // Clear caches so new area fetches immediately
     mapState.clearAllAccumulatedBuildingData();
     mapState.clearAllAccumulatedPlaceData();
 
@@ -374,7 +428,6 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
     final targetCenter = Point(coordinates: Position(city.lng, city.lat));
     final targetCam = CameraOptions(center: targetCenter, zoom: city.zoom, pitch: 15.0);
 
-    // Prefetch for destination bounds so data is ready when we arrive
     try {
       if (_mapboxMap != null) {
         final targetBounds = await _mapboxMap!.coordinateBoundsForCamera(targetCam);
@@ -383,10 +436,8 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
       }
     } catch (_) {}
 
-    // Fly the camera
     _moveCameraTo(targetCenter, zoom: city.zoom);
 
-    // After fly finishes, make sure we redraw (listener will also fire when data arrives)
     Future.delayed(const Duration(milliseconds: 1700), () async {
       if (!mounted) return;
       await _updateLastCameraState();
@@ -442,57 +493,16 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
     );
   }
 
-  // Terrain-horizon cache key: quantize lat/lng + 10° azimuth bucket
-  String _hKey(double lat, double lng, double azRad) {
-    final sector = ((azRad * SunUtils.deg) / 10.0).round() * 10; // 10°
-    final qLat = (lat * 200).round() / 200.0; // ~0.005°
-    final qLng = (lng * 200).round() / 200.0;
-    return "$qLat,$qLng,$sector";
-  }
-
-  List<int> _thinByGrid(List<PointAnnotationOptions> opts, int targetCount) {
-    if (opts.length <= targetCount) {
-      return List<int>.generate(opts.length, (i) => i);
-    }
-
-    const int grid = 32;
-    final chosen = <int>{};
-    final firstInCell = <int, int>{};
-
-    double _norm(double v, double a, double b) => ((v - a) / (b - a + 1e-12)).clamp(0.0, 0.9999);
-
-    double minLat = double.infinity, maxLat = -double.infinity;
-    double minLng = double.infinity, maxLng = -double.infinity;
-    for (final o in opts) {
-      final p = (o.geometry as Point).coordinates;
-      minLat = math.min(minLat, p.lat.toDouble());
-      maxLat = math.max(maxLat, p.lat.toDouble());
-      minLng = math.min(minLng, p.lng.toDouble());
-      maxLng = math.max(maxLng, p.lng.toDouble());
-    }
-
-    for (int i = 0; i < opts.length; i++) {
-      final p = (opts[i].geometry as Point).coordinates;
-      final c = (_norm(p.lng.toDouble(), minLng, maxLng) * grid).floor();
-      final r = (_norm(p.lat.toDouble(), minLat, maxLat) * grid).floor();
-      final key = r * 1000 + c;
-      if (!firstInCell.containsKey(key)) {
-        firstInCell[key] = i;
-        chosen.add(i);
-        if (chosen.length >= targetCount) break;
-      }
-    }
-    for (int i = 0; i < opts.length && chosen.length < targetCount; i++) {
-      chosen.add(i);
-    }
-
-    return chosen.toList()..sort();
-  }
-
   // ---------- Redraw ----------
   Future<void> _tryRedraw(String source) async {
     if (_isRedrawing) return;
-    if (!mounted || _mapboxMap == null || !_mapReady || !_iconsLoaded || _polygonManager == null || _pointAnnotationManager == null || _lastCameraState == null) {
+    if (!mounted ||
+        _mapboxMap == null ||
+        !_mapReady ||
+        !_iconsLoaded ||
+        _polygonManager == null ||
+        _pointAnnotationManager == null ||
+        _lastCameraState == null) {
       return;
     }
 
@@ -507,7 +517,7 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
 
       _lastDrawTime = dateTime;
 
-      final shadowLogic = await _calculateAndDrawBuildingShadows(buildings, dateTime, bounds);
+      final shadowLogic = await _calculateAndMaybeReuseBuildingShadows(buildings, dateTime, bounds);
       await _drawPlaces(places, buildings, dateTime, shadowLogic, bounds);
     } catch (e, s) {
       if (kDebugMode) print("❌ Redraw error: $e\n$s");
@@ -516,42 +526,65 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
     }
   }
 
-  Future<Map<String, List<Position>>> _calculateAndDrawBuildingShadows(
+  Future<Map<String, List<Position>>> _calculateAndMaybeReuseBuildingShadows(
       List<Building> allLoadedBuildings,
       DateTime dateTime,
       CoordinateBounds currentViewportBounds,
       ) async {
     if (!mounted || _polygonManager == null || _lastCameraState == null) return {};
 
-    try {
-      await _polygonManager!.deleteAll();
-    } catch (_) {}
-
+    final center = _lastCameraState!.center.coordinates;
     final sunPos = SunUtils.getSunPosition(
       dateTime,
-      _lastCameraState!.center.coordinates.lat.toDouble(),
-      _lastCameraState!.center.coordinates.lng.toDouble(),
+      center.lat.toDouble(),
+      center.lng.toDouble(),
     );
     final alt = sunPos['altitude']!;
     final az = sunPos['azimuth']!;
 
+    if (alt <= SunUtils.altitudeThresholdRad) {
+      if (_cachedShadows.isNotEmpty) {
+        try {
+          await _polygonManager!.deleteAll();
+        } catch (_) {}
+        _cachedShadows.clear();
+      }
+      _prevAltRad = alt;
+      _prevAzRad = az;
+      _prevShadowBounds = currentViewportBounds;
+      _prevShadowBuildingsRef = allLoadedBuildings;
+      return {};
+    }
+
+    const double altTol = 0.010; // ~0.57°
+    const double azTol = 0.035; // ~2°
+    final canReuse = _cachedShadows.isNotEmpty &&
+        _prevAltRad != null &&
+        _prevAzRad != null &&
+        (alt - _prevAltRad!).abs() < altTol &&
+        (_wrapAngle(az - _prevAzRad!)).abs() < azTol &&
+        _prevShadowBounds != null &&
+        _boundsClose(_prevShadowBounds!, currentViewportBounds) &&
+        identical(_prevShadowBuildingsRef, allLoadedBuildings);
+
+    if (canReuse) {
+      return _cachedShadows;
+    }
+
+    try {
+      await _polygonManager!.deleteAll();
+    } catch (_) {}
+
     final calculated = <String, List<Position>>{};
     final draw = <PolygonAnnotationOptions>[];
 
-    if (alt <= SunUtils.altitudeThresholdRad) {
-      for (final b in allLoadedBuildings) {
-        calculated.putIfAbsent(b.id, () => []);
-      }
-      return calculated;
-    }
-
-    // opacity curve
+    // Opacity curve
     final altDeg = alt * SunUtils.deg;
-    const double maxShadowOpacity = 0.22;
+    const double maxShadowOpacity = 0.20;
     const double horizonFadeEndAlt = SunUtils.altitudeThresholdRad * SunUtils.deg + 0.5;
     const double horizonFadeStartAlt = 5.0;
-    const double peakOpacityStartAlt = 20.0;
-    const double peakOpacityEndAlt = 65.0;
+    const double peakOpacityStartAlt = 18.0;
+    const double peakOpacityEndAlt = 62.0;
     const double zenithFadeStartAlt = peakOpacityEndAlt;
     const double zenithEndAlt = 88.0;
 
@@ -570,14 +603,16 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
     baseOpacity = baseOpacity.clamp(0.0, maxShadowOpacity);
 
     if (baseOpacity <= 0.005) {
-      for (final b in allLoadedBuildings) {
-        calculated.putIfAbsent(b.id, () => []);
-      }
+      _cachedShadows.clear();
+      _prevAltRad = alt;
+      _prevAzRad = az;
+      _prevShadowBounds = currentViewportBounds;
+      _prevShadowBuildingsRef = allLoadedBuildings;
       return calculated;
     }
 
     final zoom = _lastCameraState!.zoom;
-    final centerLat = _lastCameraState!.center.coordinates.lat.toDouble();
+    final centerLat = center.lat.toDouble();
     final mpp = SunUtils.metersPerPixel(centerLat, zoom);
     final minShadowMeters = math.max(0.5, mpp * 1.2);
 
@@ -585,7 +620,7 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
     final ne = currentViewportBounds.northeast.coordinates;
     double _toCol(double lng) => ((lng - sw.lng) / (ne.lng - sw.lng + 1e-12)).clamp(0.0, 0.9999);
     double _toRow(double lat) => ((lat - sw.lat) / (ne.lat - sw.lat + 1e-12)).clamp(0.0, 0.9999);
-    const int gridN = 32;
+    const int gridN = 24; // smaller grid to reduce attenuation cost
     final density = List.generate(gridN, (_) => List.filled(gridN, 0));
     const baseShadowColor = Color(0xFF1A1A1A);
 
@@ -617,7 +652,7 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
       final seen = density[row][col];
 
       final overlapFactor = 1.0 / (1.0 + seen);
-      final op = (baseOpacity * overlapFactor).clamp(0.03, 0.16);
+      final op = (baseOpacity * overlapFactor).clamp(0.03, 0.15);
 
       List<Position> hole = [];
       if (b.polygon.isNotEmpty) {
@@ -645,6 +680,12 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
       } catch (_) {}
     }
 
+    _cachedShadows = calculated;
+    _prevAltRad = alt;
+    _prevAzRad = az;
+    _prevShadowBounds = currentViewportBounds;
+    _prevShadowBuildingsRef = allLoadedBuildings;
+
     return calculated;
   }
 
@@ -663,15 +704,22 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
 
     final paddedBounds = _padBounds(currentViewportBounds, _markerPadMeters);
 
-    final relevantBuildings = allLoadedBuildings.where((b) => _checkAabbIntersection(b.bounds, paddedBounds)).toList();
+    // pre-filter buildings by viewport once
+    final relevantBuildings =
+    allLoadedBuildings.where((b) => _checkAabbIntersection(b.bounds, paddedBounds)).toList();
 
     final visiblePlaceIds = <String>{};
     final visiblePlaces = <Place>[];
     final rawSunState = <String, bool>{};
 
-    int horizonBudget = 12; // limit new terrain samples per frame
+    // Horizon sampling budget heuristic
+    final heavyLoadThreshold = 600;
+    int horizonBudget = 10;
 
     for (final place in allLoadedPlaces) {
+      // type filter first (cheap)
+      if (!_enabledTypes.contains(place.type)) continue;
+
       final pos = place.location.coordinates;
       if (!_isPointInBounds(pos, paddedBounds, inclusive: true)) continue;
 
@@ -690,23 +738,27 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
       if (altRad > SunUtils.altitudeThresholdRad) {
         bool terrainBlocks = false;
         if (_useTerrainHorizon && _elevService != null) {
-          final key = _hKey(lat, lng, azRad);
-          double? hor = _horizonCache[key];
-          if (hor == null && horizonBudget > 0) {
-            try {
-              hor = await SunUtils.horizonAngleRad(
-                lat,
-                lng,
-                azRad,
-                sampleElevationM: _elevService!.sampleElevationM,
-              );
-              _horizonCache[key] = hor;
-              horizonBudget--;
-            } catch (_) {}
-          }
-          if (hor != null) {
-            final margin = _horizonMarginDeg * SunUtils.rad;
-            if (altRad < hor + margin) terrainBlocks = true;
+          if (visiblePlaces.length > heavyLoadThreshold) {
+            // skip terrain horizon checks if already very heavy
+          } else if (horizonBudget > 0) {
+            final key = _hKey(lat, lng, azRad);
+            double? hor = _horizonCache[key];
+            if (hor == null) {
+              try {
+                hor = await SunUtils.horizonAngleRad(
+                  lat,
+                  lng,
+                  azRad,
+                  sampleElevationM: _elevService!.sampleElevationM,
+                );
+                _horizonCache[key] = hor;
+                horizonBudget--;
+              } catch (_) {}
+            }
+            if (hor != null) {
+              final margin = _horizonMarginDeg * SunUtils.rad;
+              if (altRad < hor + margin) terrainBlocks = true;
+            }
           }
         }
 
@@ -776,7 +828,7 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
       requiredFraction: 0.66,
     );
 
-    // 1) remove annotations that are now outside padded viewport
+    // 1) remove annotations now outside padded viewport or filtered out
     final toDelete = <PointAnnotation>[];
     final toDeletePlaceIds = <String>[];
 
@@ -784,7 +836,10 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
       final pid = entry.key;
       final ann = entry.value;
       final pt = ann.geometry.coordinates;
-      if (!visiblePlaceIds.contains(pid) || !_isPointInBounds(pt, paddedBounds, inclusive: true)) {
+
+      final placeForAnn = _annotationIdToPlace[ann.id];
+      final wasFilteredOut = placeForAnn == null || !_enabledTypes.contains(placeForAnn.type);
+      if (!visiblePlaceIds.contains(pid) || !_isPointInBounds(pt, paddedBounds, inclusive: true) || wasFilteredOut) {
         toDelete.add(ann);
         toDeletePlaceIds.add(pid);
       }
@@ -870,7 +925,6 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
     }
 
     if (toCreate.isNotEmpty) {
-      // create one-by-one to maintain mapping
       for (int i = 0; i < toCreate.length; i++) {
         try {
           final ann = await _pointAnnotationManager!.create(toCreate[i]);
@@ -887,6 +941,53 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
       ..clear()
       ..addAll(smoothed);
     _iconScaleBucket = newBucket;
+  }
+
+  // Terrain-horizon cache key: quantize lat/lng + 10° azimuth bucket
+  String _hKey(double lat, double lng, double azRad) {
+    final sector = ((azRad * SunUtils.deg) / 10.0).round() * 10; // 10°
+    final qLat = (lat * 200).round() / 200.0; // ~0.005°
+    final qLng = (lng * 200).round() / 200.0;
+    return "$qLat,$qLng,$sector";
+  }
+
+  List<int> _thinByGrid(List<PointAnnotationOptions> opts, int targetCount) {
+    if (opts.length <= targetCount) {
+      return List<int>.generate(opts.length, (i) => i);
+    }
+
+    const int grid = 32;
+    final chosen = <int>{};
+    final firstInCell = <int, int>{};
+
+    double _norm(double v, double a, double b) => ((v - a) / (b - a + 1e-12)).clamp(0.0, 0.9999);
+
+    double minLat = double.infinity, maxLat = -double.infinity;
+    double minLng = double.infinity, maxLng = -double.infinity;
+    for (final o in opts) {
+      final p = (o.geometry as Point).coordinates;
+      minLat = math.min(minLat, p.lat.toDouble());
+      maxLat = math.max(maxLat, p.lat.toDouble());
+      minLng = math.min(minLng, p.lng.toDouble());
+      maxLng = math.max(maxLng, p.lng.toDouble());
+    }
+
+    for (int i = 0; i < opts.length; i++) {
+      final p = (opts[i].geometry as Point).coordinates;
+      final c = (_norm(p.lng.toDouble(), minLng, maxLng) * grid).floor();
+      final r = (_norm(p.lat.toDouble(), minLat, maxLat) * grid).floor();
+      final key = r * 1000 + c;
+      if (!firstInCell.containsKey(key)) {
+        firstInCell[key] = i;
+        chosen.add(i);
+        if (chosen.length >= targetCount) break;
+      }
+    }
+    for (int i = 0; i < opts.length && chosen.length < targetCount; i++) {
+      chosen.add(i);
+    }
+
+    return chosen.toList()..sort();
   }
 
   // ---------- UI ----------
@@ -1010,7 +1111,7 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
             ),
           ),
 
-          // Country & language bar + City filter
+          // Country & language bar + City filter (top-right)
           Positioned(
             top: 68,
             right: 16,
@@ -1030,6 +1131,60 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
                     cities: _citiesForCountry,
                     label: strs.pickCity,
                     onPick: (city) => _goToCity(city),
+                  ),
+                ],
+              ),
+            ),
+          ),
+
+          // --- Filter button + dropdown (top-left) ---
+          if (_filterOpen)
+            Positioned.fill(
+              child: GestureDetector(
+                behavior: HitTestBehavior.translucent,
+                onTap: () => setState(() => _filterOpen = false),
+                child: const SizedBox.expand(),
+              ),
+            ),
+
+          Positioned(
+            top: 68,
+            left: 16,
+            child: SafeArea(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  _FilterToggleButton(
+                    isOpen: _filterOpen,
+                    activeCount: _enabledTypes.length,
+                    onTap: () => setState(() => _filterOpen = !_filterOpen),
+                  ),
+                  AnimatedSwitcher(
+                    duration: const Duration(milliseconds: 180),
+                    transitionBuilder: (child, anim) =>
+                        SizeTransition(sizeFactor: anim, axisAlignment: -1.0, child: child),
+                    child: _filterOpen
+                        ? Padding(
+                      padding: const EdgeInsets.only(top: 6),
+                      child: ConstrainedBox(
+                        constraints: const BoxConstraints(maxWidth: 300),
+                        child: _TypeFilterDropdown(
+                          strs: strs,
+                          enabled: _enabledTypes,
+                          onToggle: (t) {
+                            setState(() {
+                              if (_enabledTypes.contains(t)) {
+                                _enabledTypes.remove(t);
+                              } else {
+                                _enabledTypes.add(t);
+                              }
+                            });
+                            _tryRedraw("type filter change");
+                          },
+                        ),
+                      ),
+                    )
+                        : const SizedBox.shrink(),
                   ),
                 ],
               ),
@@ -1142,27 +1297,20 @@ class _MapScreenState extends State<MapScreen> with AutomaticKeepAliveClientMixi
     final candidates = <Uri>[];
 
     if (defaultTargetPlatform == TargetPlatform.android) {
-      // Prefer Google Maps app
       candidates.add(Uri.parse("google.navigation:q=$lat,$lng&mode=d"));
-      // geo URI with a label (will open Maps if available)
       candidates.add(Uri.parse("geo:0,0?q=$lat,$lng($label)"));
     } else if (defaultTargetPlatform == TargetPlatform.iOS) {
-      // Google Maps app on iOS
       candidates.add(Uri.parse("comgooglemaps://?daddr=$lat,$lng&directionsmode=driving"));
-      // Apple Maps fallback
       candidates.add(Uri.parse("maps://?daddr=$lat,$lng&dirflg=d"));
     }
 
-    // Universal HTTP fallback (browser if no app)
     candidates.add(Uri.parse("https://www.google.com/maps/dir/?api=1&destination=$lat,$lng&travelmode=driving"));
 
     for (final uri in candidates) {
       try {
         final ok = await launchUrl(uri, mode: LaunchMode.externalApplication);
         if (ok) return;
-      } catch (_) {
-        // keep trying next candidate
-      }
+      } catch (_) {}
     }
 
     if (!mounted) return;
@@ -1182,6 +1330,7 @@ class AnnotationClickListener extends OnPointAnnotationClickListener {
   void onPointAnnotationClick(PointAnnotation annotation) => onAnnotationClick(annotation);
 }
 
+// --------- UI bits ---------
 class _CountryLangBar extends StatelessWidget {
   final Country country;
   final AppLang lang;
@@ -1340,6 +1489,115 @@ class _CityFilterChip extends StatelessWidget {
             const SizedBox(width: 4),
             const Icon(Icons.arrow_drop_down),
           ]),
+        ),
+      ),
+    );
+  }
+}
+
+class _FilterToggleButton extends StatelessWidget {
+  final bool isOpen;
+  final int activeCount;
+  final VoidCallback onTap;
+  const _FilterToggleButton({
+    required this.isOpen,
+    required this.activeCount,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
+    return Tooltip(
+      message: 'Filter',
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(24),
+        child: Stack(
+          clipBehavior: Clip.none,
+          children: [
+            Container(
+              height: 40,
+              width: 40,
+              decoration: BoxDecoration(
+                color: colors.surface.withOpacity(0.95),
+                borderRadius: BorderRadius.circular(20),
+                border: Border.all(color: colors.outlineVariant),
+                boxShadow: kElevationToShadow[2],
+              ),
+              alignment: Alignment.center,
+              child: Icon(Icons.tune_rounded, size: 20, color: colors.onSurface),
+            ),
+            Positioned(
+              right: -2,
+              top: -2,
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                decoration: BoxDecoration(
+                  color: colors.primary,
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: Text(
+                  '$activeCount',
+                  style: const TextStyle(fontSize: 10, color: Colors.white, fontWeight: FontWeight.w700),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _TypeFilterDropdown extends StatelessWidget {
+  final Strs strs;
+  final Set<PlaceType> enabled;
+  final ValueChanged<PlaceType> onToggle;
+  const _TypeFilterDropdown({
+    required this.strs,
+    required this.enabled,
+    required this.onToggle,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
+
+    Widget chip(String label, PlaceType type, IconData icon) {
+      final sel = enabled.contains(type);
+      return FilterChip(
+        label: Text(label),
+        avatar: Icon(icon, size: 18),
+        selected: sel,
+        onSelected: (_) => onToggle(type),
+        backgroundColor: colors.surfaceVariant.withOpacity(0.35),
+        selectedColor: colors.primary.withOpacity(0.20),
+        checkmarkColor: colors.primary,
+        labelStyle: TextStyle(
+          color: sel ? colors.onPrimaryContainer : colors.onSurface,
+          fontWeight: FontWeight.w500,
+        ),
+        shape: StadiumBorder(
+          side: BorderSide(color: sel ? colors.primary : colors.outlineVariant),
+        ),
+      );
+    }
+
+    return Material(
+      elevation: 4,
+      borderRadius: BorderRadius.circular(14),
+      color: colors.surface.withOpacity(0.98),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
+        child: Wrap(
+          spacing: 8,
+          runSpacing: 8,
+          children: [
+            chip(strs.cafes, PlaceType.cafe, Icons.local_cafe_rounded),
+            chip(strs.pubs, PlaceType.pub, Icons.local_bar_rounded),
+            chip(strs.parks, PlaceType.park, Icons.park_rounded),
+          ],
         ),
       ),
     );
